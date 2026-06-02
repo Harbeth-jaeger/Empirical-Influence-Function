@@ -1,0 +1,12 @@
+Baseline,Dataset,Language,Pass@1,Pass@10,N,N_total,N_unsupported
+Base Qwen,humaneval,python,0.049011,0.106621,5815,5815,0
+Base Qwen,mceval,c,0.061728,0.160494,81,81,0
+Base Qwen,mceval,cpp,0.036585,0.121951,82,82,0
+Base Qwen,mceval,csharp,0.036145,0.120482,83,83,0
+Base Qwen,mceval,go,0.012500,0.100000,80,80,0
+Base Qwen,mceval,java,0.000000,0.062500,96,96,0
+Base Qwen,mceval,python,0.078652,0.112360,89,89,0
+Base Qwen,safim,cpp,0.012279,0.043478,4968,4968,0
+Base Qwen,safim,csharp,0.000000,0.009452,529,529,0
+Base Qwen,safim,java,0.005647,0.031868,2479,2479,0
+Base Qwen,safim,python,0.103106,0.207453,805,805,0

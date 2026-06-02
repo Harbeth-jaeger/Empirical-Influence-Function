@@ -1,0 +1,388 @@
+{
+  "experiment_meta": {
+    "selection_source": "sft_test",
+    "num_cases": 1,
+    "sample_indices": [
+      35
+    ],
+    "forced_target_token_index": 1779,
+    "top_m_train_samples": 1,
+    "lambdas": [
+      1.0,
+      10.0,
+      100.0
+    ],
+    "epochs": 5,
+    "lr": 5e-05,
+    "freeze_strategy": "qk_first",
+    "attention_layer_idx": 0,
+    "saliency_definition": "input_x_gradient",
+    "data_attribution_method": "correlation_gradient_coarse_scan",
+    "saliency_temperature": 0.5,
+    "contrast_margin": 0.03,
+    "contrast_ratio": 0.5,
+    "kl_coef": 0.02,
+    "contrast_topk": 32,
+    "auto_build_gradient_cache": true
+  },
+  "cases": [
+    {
+      "sample_index": 35,
+      "selection_source": "sft_test",
+      "selection_score": null,
+      "query_token": {
+        "token_index": 1779,
+        "answer_token_offset": 2,
+        "ground_truth_token_id": 1190,
+        "ground_truth_token_text": "Object",
+        "wrong_token_id": 1190,
+        "wrong_token_text": "Object",
+        "baseline_gt_logit": 33.5,
+        "baseline_wrong_logit": 33.5,
+        "baseline_margin": 0.0
+      },
+      "test_marked_token": {
+        "index": 1731,
+        "token": "func",
+        "baseline_saliency": 0.148438
+      },
+      "related_train_samples": [
+        {
+          "train_sample_id": 7579,
+          "gradient_influence_score": 0.081224,
+          "train_target_token": {
+            "token_index": 253,
+            "token_text": "_,"
+          },
+          "train_marked_token": {
+            "index": 83,
+            "token": "fmt",
+            "baseline_saliency": 0.061768
+          },
+          "conditions": [
+            {
+              "objective": "baseline",
+              "label": "Baseline",
+              "boost_coef": null,
+              "training_summary": {
+                "final_total_loss": null,
+                "final_loss": null,
+                "final_ce_loss": null,
+                "final_saliency_loss": null,
+                "final_contrast_loss": null,
+                "final_stability_kl_loss": null
+              },
+              "train_metrics_before": {
+                "marked_token_saliency": 0.061768
+              },
+              "train_metrics_after": {
+                "marked_token_saliency": 0.061768
+              },
+              "delta_train_saliency": 0.0,
+              "test_metrics_before": {
+                "marked_token_saliency": 0.148438,
+                "gt_logit": 33.5,
+                "wrong_logit": 33.5,
+                "gt_prob": 0.999999,
+                "wrong_prob": 0.999999,
+                "margin": 0.0
+              },
+              "test_metrics_after": {
+                "marked_token_saliency": 0.148438,
+                "gt_logit": 33.5,
+                "wrong_logit": 33.5,
+                "gt_prob": 0.999999,
+                "wrong_prob": 0.999999,
+                "margin": 0.0
+              },
+              "delta_test_saliency": 0.0,
+              "delta_gt_logit": 0.0,
+              "delta_wrong_logit": 0.0,
+              "delta_margin": 0.0
+            },
+            {
+              "objective": "ce_only",
+              "label": "CE-only",
+              "boost_coef": 0.0,
+              "training_summary": {
+                "final_total_loss": 0.001503,
+                "final_loss": 0.001503,
+                "final_ce_loss": 0.001503,
+                "final_saliency_loss": 0.0,
+                "final_contrast_loss": 0.0,
+                "final_stability_kl_loss": 0.0
+              },
+              "train_metrics_before": {
+                "marked_token_saliency": 0.061768
+              },
+              "train_metrics_after": {
+                "marked_token_saliency": 0.100098
+              },
+              "delta_train_saliency": 0.03833,
+              "test_metrics_before": {
+                "marked_token_saliency": 0.148438,
+                "gt_logit": 33.5,
+                "wrong_logit": 33.5,
+                "gt_prob": 0.999999,
+                "wrong_prob": 0.999999,
+                "margin": 0.0
+              },
+              "test_metrics_after": {
+                "marked_token_saliency": 0.001747,
+                "gt_logit": 33.25,
+                "wrong_logit": 33.25,
+                "gt_prob": 0.999999,
+                "wrong_prob": 0.999999,
+                "margin": 0.0
+              },
+              "delta_test_saliency": -0.14669,
+              "delta_gt_logit": -0.25,
+              "delta_wrong_logit": -0.25,
+              "delta_margin": 0.0
+            },
+            {
+              "objective": "saliency_only",
+              "label": "saliency_loss-only(lambda=1)",
+              "boost_coef": 1.0,
+              "training_summary": {
+                "final_total_loss": 5.34375,
+                "final_loss": 5.34375,
+                "final_ce_loss": 0.0,
+                "final_saliency_loss": 5.34375,
+                "final_contrast_loss": 0.0,
+                "final_stability_kl_loss": 0.00066
+              },
+              "train_metrics_before": {
+                "marked_token_saliency": 0.061768
+              },
+              "train_metrics_after": {
+                "marked_token_saliency": 0.117188
+              },
+              "delta_train_saliency": 0.05542,
+              "test_metrics_before": {
+                "marked_token_saliency": 0.148438,
+                "gt_logit": 33.5,
+                "wrong_logit": 33.5,
+                "gt_prob": 0.999999,
+                "wrong_prob": 0.999999,
+                "margin": 0.0
+              },
+              "test_metrics_after": {
+                "marked_token_saliency": 0.000353,
+                "gt_logit": 33.75,
+                "wrong_logit": 33.75,
+                "gt_prob": 1.0,
+                "wrong_prob": 1.0,
+                "margin": 0.0
+              },
+              "delta_test_saliency": -0.148085,
+              "delta_gt_logit": 0.25,
+              "delta_wrong_logit": 0.25,
+              "delta_margin": 0.0
+            },
+            {
+              "objective": "saliency_only",
+              "label": "saliency_loss-only(lambda=10)",
+              "boost_coef": 10.0,
+              "training_summary": {
+                "final_total_loss": 54.0,
+                "final_loss": 54.0,
+                "final_ce_loss": 0.0,
+                "final_saliency_loss": 5.40625,
+                "final_contrast_loss": 0.0,
+                "final_stability_kl_loss": 0.000645
+              },
+              "train_metrics_before": {
+                "marked_token_saliency": 0.061768
+              },
+              "train_metrics_after": {
+                "marked_token_saliency": 0.090332
+              },
+              "delta_train_saliency": 0.028564,
+              "test_metrics_before": {
+                "marked_token_saliency": 0.148438,
+                "gt_logit": 33.5,
+                "wrong_logit": 33.5,
+                "gt_prob": 0.999999,
+                "wrong_prob": 0.999999,
+                "margin": 0.0
+              },
+              "test_metrics_after": {
+                "marked_token_saliency": 0.009644,
+                "gt_logit": 33.75,
+                "wrong_logit": 33.75,
+                "gt_prob": 0.999999,
+                "wrong_prob": 0.999999,
+                "margin": 0.0
+              },
+              "delta_test_saliency": -0.138794,
+              "delta_gt_logit": 0.25,
+              "delta_wrong_logit": 0.25,
+              "delta_margin": 0.0
+            },
+            {
+              "objective": "saliency_only",
+              "label": "saliency_loss-only(lambda=100)",
+              "boost_coef": 100.0,
+              "training_summary": {
+                "final_total_loss": 540.0,
+                "final_loss": 540.0,
+                "final_ce_loss": 0.0,
+                "final_saliency_loss": 5.40625,
+                "final_contrast_loss": 0.0,
+                "final_stability_kl_loss": 0.00066
+              },
+              "train_metrics_before": {
+                "marked_token_saliency": 0.061768
+              },
+              "train_metrics_after": {
+                "marked_token_saliency": 0.053955
+              },
+              "delta_train_saliency": -0.007812,
+              "test_metrics_before": {
+                "marked_token_saliency": 0.148438,
+                "gt_logit": 33.5,
+                "wrong_logit": 33.5,
+                "gt_prob": 0.999999,
+                "wrong_prob": 0.999999,
+                "margin": 0.0
+              },
+              "test_metrics_after": {
+                "marked_token_saliency": 0.016479,
+                "gt_logit": 34.0,
+                "wrong_logit": 34.0,
+                "gt_prob": 1.0,
+                "wrong_prob": 1.0,
+                "margin": 0.0
+              },
+              "delta_test_saliency": -0.131958,
+              "delta_gt_logit": 0.5,
+              "delta_wrong_logit": 0.5,
+              "delta_margin": 0.0
+            },
+            {
+              "objective": "ce_saliency",
+              "label": "CE+saliency_loss(lambda=1)",
+              "boost_coef": 1.0,
+              "training_summary": {
+                "final_total_loss": 5.377073,
+                "final_loss": 5.377073,
+                "final_ce_loss": 0.002059,
+                "final_saliency_loss": 5.375,
+                "final_contrast_loss": 0.0,
+                "final_stability_kl_loss": 0.000751
+              },
+              "train_metrics_before": {
+                "marked_token_saliency": 0.061768
+              },
+              "train_metrics_after": {
+                "marked_token_saliency": 0.102051
+              },
+              "delta_train_saliency": 0.040283,
+              "test_metrics_before": {
+                "marked_token_saliency": 0.148438,
+                "gt_logit": 33.5,
+                "wrong_logit": 33.5,
+                "gt_prob": 0.999999,
+                "wrong_prob": 0.999999,
+                "margin": 0.0
+              },
+              "test_metrics_after": {
+                "marked_token_saliency": 0.00074,
+                "gt_logit": 33.75,
+                "wrong_logit": 33.75,
+                "gt_prob": 1.0,
+                "wrong_prob": 1.0,
+                "margin": 0.0
+              },
+              "delta_test_saliency": -0.147697,
+              "delta_gt_logit": 0.25,
+              "delta_wrong_logit": 0.25,
+              "delta_margin": 0.0
+            },
+            {
+              "objective": "ce_saliency",
+              "label": "CE+saliency_loss(lambda=10)",
+              "boost_coef": 10.0,
+              "training_summary": {
+                "final_total_loss": 53.752182,
+                "final_loss": 53.752182,
+                "final_ce_loss": 0.002169,
+                "final_saliency_loss": 5.375,
+                "final_contrast_loss": 0.0,
+                "final_stability_kl_loss": 0.000648
+              },
+              "train_metrics_before": {
+                "marked_token_saliency": 0.061768
+              },
+              "train_metrics_after": {
+                "marked_token_saliency": 0.083008
+              },
+              "delta_train_saliency": 0.02124,
+              "test_metrics_before": {
+                "marked_token_saliency": 0.148438,
+                "gt_logit": 33.5,
+                "wrong_logit": 33.5,
+                "gt_prob": 0.999999,
+                "wrong_prob": 0.999999,
+                "margin": 0.0
+              },
+              "test_metrics_after": {
+                "marked_token_saliency": 0.000177,
+                "gt_logit": 33.75,
+                "wrong_logit": 33.75,
+                "gt_prob": 0.999999,
+                "wrong_prob": 0.999999,
+                "margin": 0.0
+              },
+              "delta_test_saliency": -0.14826,
+              "delta_gt_logit": 0.25,
+              "delta_wrong_logit": 0.25,
+              "delta_margin": 0.0
+            },
+            {
+              "objective": "ce_saliency",
+              "label": "CE+saliency_loss(lambda=100)",
+              "boost_coef": 100.0,
+              "training_summary": {
+                "final_total_loss": 544.002625,
+                "final_loss": 544.002625,
+                "final_ce_loss": 0.002654,
+                "final_saliency_loss": 5.4375,
+                "final_contrast_loss": 0.0,
+                "final_stability_kl_loss": 0.00069
+              },
+              "train_metrics_before": {
+                "marked_token_saliency": 0.061768
+              },
+              "train_metrics_after": {
+                "marked_token_saliency": 0.069336
+              },
+              "delta_train_saliency": 0.007568,
+              "test_metrics_before": {
+                "marked_token_saliency": 0.148438,
+                "gt_logit": 33.5,
+                "wrong_logit": 33.5,
+                "gt_prob": 0.999999,
+                "wrong_prob": 0.999999,
+                "margin": 0.0
+              },
+              "test_metrics_after": {
+                "marked_token_saliency": 0.004517,
+                "gt_logit": 33.75,
+                "wrong_logit": 33.75,
+                "gt_prob": 1.0,
+                "wrong_prob": 1.0,
+                "margin": 0.0
+              },
+              "delta_test_saliency": -0.143921,
+              "delta_gt_logit": 0.25,
+              "delta_wrong_logit": 0.25,
+              "delta_margin": 0.0
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

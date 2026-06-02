@@ -1,0 +1,12 @@
+Baseline,Dataset,Language,Pass@1,Pass@10,N,N_total,N_unsupported
+XTF,humaneval,python,0.237661,0.300774,5815,5815,0
+XTF,mceval,c,0.395062,0.419753,81,81,0
+XTF,mceval,cpp,0.329268,0.439024,82,82,0
+XTF,mceval,csharp,0.409639,0.506024,83,83,0
+XTF,mceval,go,0.287500,0.375000,80,80,0
+XTF,mceval,java,0.552083,0.645833,96,96,0
+XTF,mceval,python,0.382022,0.584270,89,89,0
+XTF,safim,cpp,0.081320,0.156200,4968,4968,0
+XTF,safim,csharp,0.069943,0.128544,529,529,0
+XTF,safim,java,0.170230,0.281969,2479,2479,0
+XTF,safim,python,0.144099,0.227329,805,805,0
