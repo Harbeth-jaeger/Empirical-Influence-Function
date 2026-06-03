@@ -228,8 +228,17 @@ class AnnotatedSFTTrainer(Trainer):
                     "saliency_eps_floor_effective": diag.floor_eps if diag is not None else self.saliency_floor_eps,
                     "saliency_eps_floor_batch": diag.batch_floor_eps if diag is not None else 0.0,
                     "saliency_eps_floor_logit": diag.floor_logit_eps if diag is not None else 0.0,
+                    "saliency/Cbar": diag.avg_C if diag is not None else 0.0,
+                    "saliency/Nbar": diag.avg_N if diag is not None else 0.0,
+                    "saliency/ratio": diag.avg_ratio if diag is not None else 0.0,
+                    "saliency/n_queries": diag.n_queries if diag is not None else 0,
+                    "saliency/floor_eps": diag.floor_eps if diag is not None else self.saliency_floor_eps,
+                    "saliency/floor_logit": diag.floor_logit_eps if diag is not None else 0.0,
                 })
             if detail is not None:
+                mean_rank = 0.0
+                if detail.query_stats:
+                    mean_rank = sum(float(x.get("mean_annotation_rank", 0.0)) for x in detail.query_stats) / len(detail.query_stats)
                 log_payload.update({
                     "strict_Cbar": detail.avg_C,
                     "strict_Nbar": detail.avg_N,
@@ -239,6 +248,10 @@ class AnnotatedSFTTrainer(Trainer):
                     "strict_recall_at_k": detail.recall_at_k,
                     "strict_precision_at_k": detail.precision_at_k,
                     "strict_map_at_k": detail.map_at_k,
+                    "saliency/recall_at_k": detail.recall_at_k,
+                    "saliency/precision_at_k": detail.precision_at_k,
+                    "saliency/map_at_k": detail.map_at_k,
+                    "saliency/mean_positive_rank": mean_rank,
                 })
             self.log(log_payload)
 

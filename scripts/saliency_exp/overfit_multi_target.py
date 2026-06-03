@@ -40,11 +40,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--ce_lambda", type=float, default=1.0, help="Deprecated compatibility arg; saliency_ce now uses CE + saliency_lambda * Lsal.")
     parser.add_argument("--saliency_lambda", type=float, default=0.1, help="Weight for Lsal in saliency_ce: total = CE + saliency_lambda * Lsal")
-    parser.add_argument("--alpha", type=float, default=1.5, help="InfoNCE temperature used by current loss.py")
+    parser.add_argument("--alpha", type=float, default=1.5, help="Temperature tau used by current loss.py")
     parser.add_argument("--eps", type=float, default=1e-8)
+    parser.add_argument("--saliency_loss_type", choices=["softmax", "softmax_margin"], default="softmax_margin")
+    parser.add_argument("--floor_eps", type=float, default=0.0, help="Fixed saliency-space negative floor for softmax_margin.")
+    parser.add_argument("--floor_logit_eps", type=float, default=None, help="Fixed logit-space negative floor for softmax_margin, e.g. -10.")
+    parser.add_argument("--source_chunk_size", type=int, default=16)
     parser.add_argument("--min_sources_per_target", type=int, default=1)
     parser.add_argument("--max_targets", type=int, default=0, help="0 means use all eligible completion targets")
     parser.add_argument("--top_k", type=int, default=10, help="K for recall@K, precision@K, and AP@K diagnostics")
+    parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--log_every", type=int, default=1)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
@@ -197,6 +202,56 @@ def build_annot_pairs(query_sources: dict[int, list[int]], device: str) -> torch
     return torch.tensor(pairs, dtype=torch.long, device=device)
 
 
+def grad_norm_by_module(model: torch.nn.Module) -> dict[str, Any]:
+    groups = {
+        "q_proj_lora": ["q_proj", "lora_"],
+        "k_proj_lora": ["k_proj", "lora_"],
+        "v_proj_lora": ["v_proj", "lora_"],
+        "o_proj_lora": ["o_proj", "lora_"],
+        "mlp_lora": ["gate_proj", "up_proj", "down_proj", "lora_"],
+        "other_trainable": [],
+    }
+    sq = {key: 0.0 for key in groups}
+    nonzero = {key: 0 for key in groups}
+    params = {key: 0 for key in groups}
+    total_sq = 0.0
+    total_nonzero = 0
+    total_params = 0
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        key = "other_trainable"
+        for candidate, needles in groups.items():
+            if candidate == "other_trainable":
+                continue
+            if all(needle in name for needle in needles):
+                key = candidate
+                break
+        params[key] += 1
+        total_params += 1
+        if param.grad is None:
+            continue
+        grad = param.grad.detach().float()
+        val = float(grad.pow(2).sum().cpu())
+        sq[key] += val
+        total_sq += val
+        if val > 0.0:
+            nonzero[key] += 1
+            total_nonzero += 1
+
+    out = {
+        "total_grad_norm": total_sq ** 0.5,
+        "total_nonzero_param_tensors": total_nonzero,
+        "total_trainable_param_tensors": total_params,
+    }
+    for key in groups:
+        out[f"{key}_grad_norm"] = sq[key] ** 0.5
+        out[f"{key}_nonzero_param_tensors"] = nonzero[key]
+        out[f"{key}_trainable_param_tensors"] = params[key]
+    return out
+
+
 def selected_query_ce_loss(outputs: Any, input_ids: torch.Tensor, query_sources: dict[int, list[int]]) -> torch.Tensor:
     queries = torch.tensor(sorted(query_sources), dtype=torch.long, device=input_ids.device)
     logits = outputs.logits[0, queries - 1, :].float()
@@ -205,32 +260,59 @@ def selected_query_ce_loss(outputs: Any, input_ids: torch.Tensor, query_sources:
 
 
 def compute_query_metrics(
-    c_matrix: torch.Tensor,
+    C_rows: torch.Tensor,
+    row_qry: torch.Tensor,
     query_sources: dict[int, list[int]],
     tokens: list[dict[str, Any]],
     *,
     alpha: float,
     eps: float,
+    loss_type: str,
+    floor_eps: float,
+    floor_logit_eps: float | None,
     top_k: int,
 ) -> tuple[list[dict[str, Any]], torch.Tensor]:
     losses = []
     query_rows: list[dict[str, Any]] = []
+    row_lookup = {int(q): idx for idx, q in enumerate(row_qry.detach().cpu().tolist())}
     for q, srcs in query_sources.items():
-        row = c_matrix[0, q, :q].float()
+        if q not in row_lookup:
+            continue
+        row = C_rows[row_lookup[q], :q].float()
         labeled = torch.tensor(srcs, dtype=torch.long, device=row.device)
-        scores = torch.log(row.clamp_min(eps))
-        logits = scores / alpha
-        log_probs = F.log_softmax(logits, dim=-1)
-        Lq = -log_probs[labeled].mean()
+        tau = max(float(alpha), float(eps))
+        if loss_type == "softmax":
+            logits = row / tau
+            log_probs = F.log_softmax(logits, dim=-1)
+            probs = log_probs.exp()
+            Lq = -log_probs[labeled].mean()
+            labeled_probs = probs[labeled]
+            floor_logit = None
+        else:
+            logits = torch.log(row + float(eps)) / tau
+            neg_mask = torch.ones_like(row, dtype=torch.bool)
+            neg_mask[labeled] = False
+            if floor_logit_eps is None:
+                floor = torch.log(logits.new_tensor(float(floor_eps) + float(eps))) / tau
+            else:
+                floor = logits.new_tensor(float(floor_logit_eps))
+            floor_logit = float(floor.detach().cpu())
+            neg_inf = torch.finfo(logits.dtype).min
+            neg_logits = torch.maximum(logits, floor).masked_fill(~neg_mask, neg_inf)
+            neg_lse = torch.logsumexp(neg_logits, dim=-1)
+            pos_log_denom = torch.logaddexp(neg_lse.expand_as(logits), logits)
+            Lq = (pos_log_denom[labeled] - logits[labeled]).mean()
+            labeled_probs = torch.exp(logits[labeled] - pos_log_denom[labeled])
         losses.append(Lq)
 
         k = len(srcs)
         k_eff = min(max(1, int(top_k)), int(row.numel()))
         order = torch.argsort(row.detach(), descending=True).cpu().tolist()
+        top_at_a = order[:max(1, min(k, len(order)))]
         top = order[:k_eff]
         labeled_set = set(srcs)
+        hit_at_a_count = sum(1 for idx in top_at_a if idx in labeled_set)
         hit_count = sum(1 for idx in top if idx in labeled_set)
-        hit_rate = hit_count / max(1, k)
         precision_at_k = hit_count / max(1, k_eff)
         recall_at_k = hit_count / max(1, k)
         hits_so_far = 0
@@ -240,45 +322,75 @@ def compute_query_metrics(
                 hits_so_far += 1
                 precision_sum += hits_so_far / rank
         ap_at_k = precision_sum / max(1, k)
+        rank_lookup = {int(idx): rank for rank, idx in enumerate(order, start=1)}
+        positive_ranks = [rank_lookup[src] for src in srcs if src in rank_lookup]
+        pos_values = row[labeled]
+        neg_mask_for_stats = torch.ones_like(row, dtype=torch.bool)
+        neg_mask_for_stats[labeled] = False
+        neg_values = row[neg_mask_for_stats]
         query_rows.append({
             "q": int(q),
             "target_token": tokens[q]["text"],
             "target_display": tokens[q]["display"],
             "num_labeled_sources": int(k),
+            "num_causal_sources": int(row.numel()),
             "top_k": int(top_k),
-            "hit_at_Aq_count": int(hit_count),
-            "hit_at_Aq": float(hit_rate),
+            "hit_at_Aq_count": int(hit_at_a_count),
+            "hit_at_Aq": float(hit_at_a_count / max(1, k)),
             "recall_at_k": float(recall_at_k),
             "precision_at_k": float(precision_at_k),
             "ap_at_k": float(ap_at_k),
             "Lq": float(Lq.detach().cpu()),
+            "C_pos_mean": float(pos_values.detach().mean().cpu()),
+            "C_neg_mean": float(neg_values.detach().mean().cpu()) if neg_values.numel() else 0.0,
+            "ratio": float((pos_values.detach().mean() / neg_values.detach().mean().clamp_min(float(eps))).cpu()) if neg_values.numel() else 0.0,
+            "mean_positive_rank": float(sum(positive_ranks) / max(1, len(positive_ranks))),
+            "min_positive_rank": int(min(positive_ranks)) if positive_ranks else 0,
+            "max_positive_rank": int(max(positive_ranks)) if positive_ranks else 0,
+            "positive_probs": [float(x) for x in labeled_probs.detach().cpu().tolist()],
+            "mean_positive_prob": float(labeled_probs.detach().mean().cpu()),
+            "floor_logit": floor_logit,
         })
     if not losses:
         raise RuntimeError("No selected queries to optimize")
     return query_rows, torch.stack(losses).mean()
 
-
 def format_record(record: dict[str, Any]) -> str:
+    grad = record.get("grad_norms", {})
     head = (
         f"step={record['step']:04d} Lsal={record['Lsal']:.6f} "
         f"mean_hit@Aq={record['mean_hit_at_Aq']:.4f} "
         f"R@{record['top_k']}={record['mean_recall_at_k']:.4f} "
-        f"P@{record['top_k']}={record['mean_precision_at_k']:.4f} "
         f"mAP@{record['top_k']}={record['mean_map_at_k']:.4f} "
+        f"rank={record['mean_positive_rank']:.2f} "
+        f"p_pos={record['mean_positive_prob']:.4g} "
+        f"grad={grad.get('total_grad_norm', 0.0):.4g} "
         f"num_q={record['num_queries']}"
     )
     if record.get("CE") is not None:
         head += f" CE={record['CE']:.6f} sal_lambda={record.get('saliency_lambda', 0.0):.4f} total={record['total_loss']:.6f}"
     lines = [head]
+    if grad:
+        lines.append(
+            "  grad_by_module "
+            f"q={grad.get('q_proj_lora_grad_norm', 0.0):.3g} "
+            f"k={grad.get('k_proj_lora_grad_norm', 0.0):.3g} "
+            f"v={grad.get('v_proj_lora_grad_norm', 0.0):.3g} "
+            f"o={grad.get('o_proj_lora_grad_norm', 0.0):.3g} "
+            f"mlp={grad.get('mlp_lora_grad_norm', 0.0):.3g} "
+            f"clip_pre={record.get('clip_grad_norm_pre', 0.0):.3g}"
+        )
     for qrow in record["queries"]:
         lines.append(
             f"  q=#{qrow['q']:>4} {qrow['target_display']!r} "
-            f"|Aq|={qrow['num_labeled_sources']:<2} "
+            f"|Aq|={qrow['num_labeled_sources']:<2}/{qrow['num_causal_sources']:<3} "
             f"hit@|Aq|={qrow['hit_at_Aq_count']}/{qrow['num_labeled_sources']} "
-            f"({qrow['hit_at_Aq']:.3f}) "
             f"R@{qrow['top_k']}={qrow['recall_at_k']:.3f} "
-            f"P@{qrow['top_k']}={qrow['precision_at_k']:.3f} "
-            f"AP@{qrow['top_k']}={qrow['ap_at_k']:.3f} Lq={qrow['Lq']:.6f}"
+            f"AP@{qrow['top_k']}={qrow['ap_at_k']:.3f} "
+            f"rank={qrow['mean_positive_rank']:.1f} "
+            f"C+={qrow['C_pos_mean']:.4g} C-={qrow['C_neg_mean']:.4g} "
+            f"ratio={qrow['ratio']:.3f} p+={qrow['mean_positive_prob']:.4g} "
+            f"Lq={qrow['Lq']:.6f}"
         )
     return "\n".join(lines)
 
@@ -352,7 +464,11 @@ def main() -> None:
     print(f"text  -> {text_log_path}")
     print(f"sample={args.sample_index} num_queries={len(query_sources)} num_edges={annot_pairs.size(0)}")
 
-    from src.train.loss import build_contribution_matrix, compute_saliency_loss
+    from src.train.loss import (
+        _annotation_rows_from_pairs,
+        build_contribution_rows,
+        compute_saliency_loss_from_rows,
+    )
 
     for step in range(args.steps + 1):
         should_log = step == 0 or step == args.steps or (step % max(1, args.log_every) == 0)
@@ -366,14 +482,44 @@ def main() -> None:
             use_cache=False,
             return_dict=True,
         )
-        c_matrix = build_contribution_matrix(model, outputs.hidden_states[-2], outputs.attentions[-1])
-        diag = compute_saliency_loss(c_matrix, [annot_pairs], alpha=args.alpha, eps=args.eps)
+        B, T, _ = outputs.hidden_states[-2].shape
+        row_batch, row_qry, src_all, inv = _annotation_rows_from_pairs(
+            [annot_pairs],
+            B=B,
+            T=T,
+            device=input_ids.device,
+        )
+        C_rows = build_contribution_rows(
+            model,
+            outputs.hidden_states[-2],
+            outputs.attentions[-1],
+            row_batch,
+            row_qry,
+            source_chunk_size=max(1, int(args.source_chunk_size)),
+        )
+        diag = compute_saliency_loss_from_rows(
+            C_rows,
+            row_batch,
+            row_qry,
+            src_all,
+            inv,
+            alpha=args.alpha,
+            eps=args.eps,
+            floor_eps=args.floor_eps,
+            floor_eps_mode="fixed",
+            floor_logit_eps=args.floor_logit_eps,
+            loss_type=args.saliency_loss_type,
+        )
         query_rows, Lsal_recomputed = compute_query_metrics(
-            c_matrix,
+            C_rows,
+            row_qry,
             query_sources,
             tokens,
             alpha=args.alpha,
             eps=args.eps,
+            loss_type=args.saliency_loss_type,
+            floor_eps=diag.floor_eps,
+            floor_logit_eps=diag.floor_logit_eps if diag.floor_eps_kind == "logit" else None,
             top_k=args.top_k,
         )
         Lsal = diag.loss
@@ -388,15 +534,30 @@ def main() -> None:
         else:
             total_loss = Lsal
 
+        total_loss.backward()
+        grad_norms = grad_norm_by_module(model)
+        if args.grad_clip and args.grad_clip > 0:
+            clip_norm = torch.nn.utils.clip_grad_norm_(trainable, float(args.grad_clip))
+            clip_norm_value = float(clip_norm.detach().cpu()) if isinstance(clip_norm, torch.Tensor) else float(clip_norm)
+        else:
+            clip_norm_value = grad_norms["total_grad_norm"]
+
         if should_log:
             mean_hit = sum(row["hit_at_Aq"] for row in query_rows) / len(query_rows)
             mean_recall = sum(row["recall_at_k"] for row in query_rows) / len(query_rows)
             mean_precision = sum(row["precision_at_k"] for row in query_rows) / len(query_rows)
             mean_map = sum(row["ap_at_k"] for row in query_rows) / len(query_rows)
+            mean_rank = sum(row["mean_positive_rank"] for row in query_rows) / len(query_rows)
+            mean_prob = sum(row["mean_positive_prob"] for row in query_rows) / len(query_rows)
             record = {
                 "type": "step",
                 "step": int(step),
                 "mode": args.mode,
+                "saliency_loss_type": args.saliency_loss_type,
+                "tau": float(args.alpha),
+                "floor_eps": float(diag.floor_eps),
+                "floor_logit_eps": float(diag.floor_logit_eps),
+                "floor_eps_kind": diag.floor_eps_kind,
                 "Lsal": float(Lsal.detach().cpu()),
                 "Lsal_recomputed": float(Lsal_recomputed.detach().cpu()),
                 "CE": None if ce_loss is None else float(ce_loss.detach().cpu()),
@@ -408,6 +569,10 @@ def main() -> None:
                 "mean_recall_at_k": float(mean_recall),
                 "mean_precision_at_k": float(mean_precision),
                 "mean_map_at_k": float(mean_map),
+                "mean_positive_rank": float(mean_rank),
+                "mean_positive_prob": float(mean_prob),
+                "clip_grad_norm_pre": clip_norm_value,
+                "grad_norms": grad_norms,
                 "num_queries": len(query_rows),
                 "queries": query_rows,
             }
@@ -420,10 +585,9 @@ def main() -> None:
 
         if step >= args.steps:
             break
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(trainable, 1.0)
         optimizer.step()
-        del outputs, c_matrix, diag, query_rows, Lsal_recomputed, Lsal, total_loss
+        del outputs, C_rows, diag, query_rows, Lsal_recomputed, Lsal, total_loss
+        del row_batch, row_qry, src_all, inv
         if ce_loss is not None:
             del ce_loss
         if torch.cuda.is_available():

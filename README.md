@@ -10,7 +10,6 @@ Train (模型训练与识别错题) → Attribution (双线归因：找错因与
    2. 特征归因 Token Attribution: 某一次预测或者推理中，哪些 token 导致了模型产生了错误的输出
 3. 数据治理 Data Curation：敲除或者降权不良样本，重新微调模型
 
-
 # 技术路线
 
 ### Attribution
@@ -295,9 +294,7 @@ non-annotation causal source 为：
 * **\\alpha**：margin，要求标注边贡献至少比非标注边高到一定比例。
 * **\\varepsilon**：防止分母为零。
 
-#### 最新 loss 设计
-
-新版 loss 现在不是 hinge loss，而是 InfoNCE / multi-positive NLL。
+#### loss v3
 
 对某个 query token **q**，定义它的 annotation source 集合为：
 
@@ -313,19 +310,91 @@ non-annotation causal source 为：
 
 新版 loss 先把 saliency 转成 log-score：
 
-**r\_{q,s} = \\log(C\_{q,s} + \\epsilon)**
+**r\_{q,s} = \\log(C\_{q,s} + \\epsilon\_{\\text{reg}})**
 
 然后用 temperature **\\tau** 缩放：
 
 **\\ell\_{q,s} = \\frac{r\_{q,s}}{\\tau}**
 
-代码里这个 **\\tau** 仍然叫 `alpha`，所以要注意：现在 `alpha` 不是 margin，而是 temperature。
+在所有 causal source 上做 softmax：
+
+**p\_{q,s} = \\frac{ \\exp(\\ell\_{q,s}) }{ \\sum\_{r \\in M\_q} \\exp(\\ell\_{q,r})}**
+
+对于一个 query **q**，multi-positive loss 是：
+
+**\\mathcal{L}\_q = - \\frac{1}{|A\_q|} \\sum\_{s \\in A\_q} \\log p\_{q,s}**
+
+总 saliency loss 是：
+
+**\\mathcal{L}\_{sal} = \\frac{1}{|Q|} \\sum\_{q \\in Q} \\mathcal{L}\_q**
+
+其中 **Q** 是满足下面条件的 query token 集合：
+
+**|A\_q| > 0 \\quad \\text{and} \\quad |N\_q| > 0**
+
+#### loss v4
+
+对某个 query token **q**，定义它的 annotation source 集合为：
+
+**A\_q = \\{s \\mid s \\rightarrow q \\text{ is an annotation edge},\\ s < q\\}**
+
+所有 causal source 集合为：
+
+**M\_q = \\{s \\mid s < q\\}**
+
+非 annotation source 集合为：
+
+**N\_q = M\_q \\setminus A\_q**
+
+然后用 temperature **\\tau** 缩放：
+
+**\\ell\_{q,s} = \\frac{C\_{q,s}}{\\tau}**
 
 在所有 causal source 上做 softmax：
 
-**p\_{q,s} = \\frac{ \\exp(\\ell\_{q,s}) }{ \\sum\_{r \\in N\_q} \\exp(\\max(\\ell\_{q,r},\\epsilon))+\\exp(\\ell\_{q,s}) }**
+**p\_{q,s} = \\frac{ \\exp(\\ell\_{q,s}) }{ \\sum\_{r \\in M\_q} \\exp(\\ell\_{q,r})}**
 
-经过实验结果验证可知，此处 **\\epsilon** 最优值为 **M\_q** 集合的sal 75 quantile，具体计算方式为，ce loss训练后模型对样本前向传播，计算所有存在annotation source的q token的相关causal source的sal，排序得到75 quantile的数值，即为eps
+对于一个 query **q**，multi-positive loss 是：
+
+**\\mathcal{L}\_q = - \\frac{1}{|A\_q|} \\sum\_{s \\in A\_q} \\log p\_{q,s}**
+
+总 saliency loss 是：
+
+**\\mathcal{L}\_{sal} = \\frac{1}{|Q|} \\sum\_{q \\in Q} \\mathcal{L}\_q**
+
+其中 **Q** 是满足下面条件的 query token 集合：
+
+**|A\_q| > 0 \\quad \\text{and} \\quad |N\_q| > 0**
+
+#### 最新 loss 设计
+
+InfoNCE / multi-positive NLL。
+
+对某个 query token **q**，定义它的 annotation source 集合为：
+
+**A\_q = \\{s \\mid s \\rightarrow q \\text{ is an annotation edge},\\ s < q\\}**
+
+所有 causal source 集合为：
+
+**M\_q = \\{s \\mid s < q\\}**
+
+非 annotation source 集合为：
+
+**N\_q = M\_q \\setminus A\_q**
+
+新版 loss 先把 saliency 转成 log-score：
+
+**r\_{q,s} = \\log(C\_{q,s} + \\epsilon\_{\\text{reg}})**
+
+然后用 temperature **\\tau** 缩放：
+
+**\\ell\_{q,s} = \\frac{r\_{q,s}}{\\tau}**
+
+在所有 causal source 上做 softmax：
+
+**p\_{q,s} = \\frac{ \\exp(\\ell\_{q,s}) }{\\sum\_{r \\in N\_q} \\exp(\\max(\\ell\_{q,r},\\epsilon))+\\exp(\\ell\_{q,s}) }**
+
+其中，eps 相当于负样本 floor，决定了负样本最低有多强，从数学形式上解析，eps 越大，对 neg 的惩罚力度越小。因此 eps 是关键超参数，影响到 loss 对负样本的打压力度
 
 对于一个 query **q**，multi-positive loss 是：
 
@@ -342,6 +411,41 @@ non-annotation causal source 为：
 直观理解就是：
 
 对每个 target token **q**，把所有前文 causal token 都作为候选 source，让 annotation source 在 softmax 分布里获得更高概率。它不只是要求 annotation saliency 高于平均 non-annotation saliency，而是让 annotation source 和所有 causal source 竞争排名。
+
+***附录***：下面具体展开关于 floor 这个超参数的选定
+
+符号说明：
+
+* **\\theta\_{t-1}**：进入第 **t** 个 training step 前的模型参数
+* 第 **t** step 前向传播得到 sal 分布：
+
+**S\_t = S(\\theta\_{t-1}, \\mathcal{B}\_t)**	用这个 step 的 loss 做反传和更新，得到 **\\theta\_t**
+
+* **\\epsilon\_t**：第 **t** step 训练时实际用的 eps
+
+也就是说第 **t** step 可以这样：
+
+1. 用 **\\theta\_{t-1}** 前向，得到当前 batch 的 sal 分布：
+
+**S\_t=\\{c\_{q,r}(\\theta\_{t-1})\\}**
+
+2. 计算当前 batch quantile：
+
+**\\hat{\\epsilon}\_t = Q\_{0.75}(S\_t)**	这个0.75也是一个可以调整的超参数，目前看下来0.75最佳
+
+3. EMA 得到当前 step 实际使用的 eps：这样 eps 会平滑一些，loss 不至于抖动的太厉害；另外一开始不太稳定，所有不准备加 eps
+
+**\\epsilon\_t = \\begin{cases} 0, & t < T\_{warmup}\\\\ \\hat{\\epsilon}\_t, & t = T\_{warmup}\\\\ \\beta\\epsilon\_{t-1} + (1-\\beta)\\hat{\\epsilon}\_t, & t > T\_{warmup} \\end{cases}**
+
+4. 用这个 **\\epsilon\_t** 算当前 step 的 sal loss：
+
+**\\mathcal{L}^{(t)}\_{sal} = \\mathcal{L}\_{sal}(\\theta\_{t-1}; \\epsilon\_t)**
+
+5. 反传更新到 **\\theta\_t**
+
+经过实验结果验证可知，其他超参数最优为
+
+**Q=0.75,\\quad \\beta=0.95,\\quad T\_{warmup}=10**
 
 # 工作整理
 
@@ -370,8 +474,6 @@ work的判断标准：ours跑分最高、且sal具有可解释性，pass rate和
 具体做法：
 
 1. 获取并处理数据，要求10K（用于7B基模），单语言go，短代码singleline（只挖assignment语句，return语句，函数调用的等等），无docstring和注释，无unit test和test case，可视化10个例子发给刘老师看看。***目前进度在这***
-
-
 2. 小样本标注数据，要求annotate 代码修改、对简单样本可以尽量dense一些，annotation 可视化合理
 3. 小样本benchmark，记得baseline包括base、ce loss和其他paper，oracle检验评测代码是否合理，要求ours跑分最高、且sal具有可解释性[双模型预测与 saliency 对比](http://1.95.134.216/saliency/ce500_vs_floorp75_saliency_viewer.html)，pass rate和codebleu整体数值合
 4. 全量benchmark，==完整结束==
@@ -870,23 +972,24 @@ S = P\_{\\text{model}}(\\text{Correct} \\mid \\text{Input, Output})
 
 ## 总体目录
 
-| 路径 | 作用 |
-| --- | --- |
-| `src/` | 项目核心代码。当前最关键的是 `src/annotate/` 和 `src/train/`。 |
-| `src/annotate/` | GraphSignal 标注代码。负责 simple code token 切分、结构/语义 annotation edge 生成、simple token 到 Qwen BPE token 的映射。 |
-| `src/train/` | SFT 与 saliency loss 训练代码。`train.py` 是训练入口，`dataset.py` 读取带 `attention_edges` 的样本，`loss.py` 实现 saliency 与 softmax / softmax-margin loss。 |
-| `scripts/` | 实验脚本入口。包括数据构建、benchmark 评测、saliency 诊断、治理算子等。 |
-| `scripts/go_single/` | GoSingle 专用脚本，包括数据构建、oracle 检查、已有 prediction 的 GoSingle 评测。 |
-| `scripts/benchmark/` | 通用 benchmark 评测框架，包括生成、judge、pass@k 聚合、CodeBLEU 和分片合并。 |
-| `scripts/saliency_exp/` | Saliency 诊断实验，包括 base saliency 分布统计、row/token 训练追踪、trace 可读报告渲染。 |
-| `tools/visual_annotation/` | Annotation edge 可视化与标注辅助工具。 |
-| `tools/visual_saliency/` | 训练前后 saliency 分布可视化工具，用于检查 saliency top-k 与 annotation source 的对齐情况。 |
-| `data/` | 数据目录。保存原始数据、训练数据、评测数据、已标注数据。大数据不建议提交 git。 |
-| `outputs/` | 实验输出目录。保存模型/LoRA adapter、评测结果、可视化 HTML/JSON、诊断图表和中间产物。大模型和大输出不建议提交 git。 |
-| `runs/` | 运行日志目录。长任务的训练、评测、标注、可视化日志通常放在这里。 |
-| `AGENTS.md` | 面向协作者或代码代理的项目说明，包含项目目标、工作流、目录约定和协作注意事项。 |
-| `README.md` | 项目总览文档，说明项目目标、整体流程、文件结构和关键命令。 |
-| `requirements.txt` | Python 依赖列表。实际实验优先使用项目内 `.micromamba/envs/eif-bench` 环境。 |
+
+| 路径                       | 作用                                                                                                                                                           |
+| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/`                     | 项目核心代码。当前最关键的是`src/annotate/` 和 `src/train/`。                                                                                                  |
+| `src/annotate/`            | GraphSignal 标注代码。负责 simple code token 切分、结构/语义 annotation edge 生成、simple token 到 Qwen BPE token 的映射。                                     |
+| `src/train/`               | SFT 与 saliency loss 训练代码。`train.py` 是训练入口，`dataset.py` 读取带 `attention_edges` 的样本，`loss.py` 实现 saliency 与 softmax / softmax-margin loss。 |
+| `scripts/`                 | 实验脚本入口。包括数据构建、benchmark 评测、saliency 诊断、治理算子等。                                                                                        |
+| `scripts/go_single/`       | GoSingle 专用脚本，包括数据构建、oracle 检查、已有 prediction 的 GoSingle 评测。                                                                               |
+| `scripts/benchmark/`       | 通用 benchmark 评测框架，包括生成、judge、pass@k 聚合、CodeBLEU 和分片合并。                                                                                   |
+| `scripts/saliency_exp/`    | Saliency 诊断实验，包括 base saliency 分布统计、row/token 训练追踪、trace 可读报告渲染。                                                                       |
+| `tools/visual_annotation/` | Annotation edge 可视化与标注辅助工具。                                                                                                                         |
+| `tools/visual_saliency/`   | 训练前后 saliency 分布可视化工具，用于检查 saliency top-k 与 annotation source 的对齐情况。                                                                    |
+| `data/`                    | 数据目录。保存原始数据、训练数据、评测数据、已标注数据。大数据不建议提交 git。                                                                                 |
+| `outputs/`                 | 实验输出目录。保存模型/LoRA adapter、评测结果、可视化 HTML/JSON、诊断图表和中间产物。大模型和大输出不建议提交 git。                                            |
+| `runs/`                    | 运行日志目录。长任务的训练、评测、标注、可视化日志通常放在这里。                                                                                               |
+| `AGENTS.md`                | 面向协作者或代码代理的项目说明，包含项目目标、工作流、目录约定和协作注意事项。                                                                                 |
+| `README.md`                | 项目总览文档，说明项目目标、整体流程、文件结构和关键命令。                                                                                                     |
+| `requirements.txt`         | Python 依赖列表。实际实验优先使用项目内`.micromamba/envs/eif-bench` 环境。                                                                                     |
 
 隐藏目录如 `.git/`、`.vscode/`、`.venv/`、`.micromamba/`、`.local/` 主要服务于版本管理、IDE 配置或本地环境，不属于项目算法流程本身。
 
@@ -910,30 +1013,32 @@ GoSingle 是当前主要实验任务：从 Go 函数里挖出单行 statement，
 
 ### 关键数据文件
 
-| 路径 | 作用 |
-| --- | --- |
-| `data/go_single/raw_data/` | GoSingle 原始数据，包括 CodeSearchNet Go 和 MCEval Go。 |
-| `data/go_single/train_data/go_single_train_v2_canonical.jsonl` | 从 CodeSearchNet Go 构建出的 canonical 训练样本，含 `prefix`、`target`、`suffix`、`target_kind`。 |
-| `data/go_single/train_data/go_single_train_v2_chatml.jsonl` | canonical 训练样本渲染为 ChatML 后的版本。 |
-| `data/go_single/train_data/go_single_train_v2_graphsignal_500_compact.json` | 已标注 500 条 GoSingle 训练数据，是当前 saliency loss 训练的主输入。每行含 `input_ids`、`label`、`length`、`attention_edges`。 |
-| `data/go_single/eval_data/mceval_go_single_v2_canonical.jsonl` | 从 MCEval Go 构建出的 canonical 评测样本，含 judge 所需 `judge_payload`。 |
-| `data/go_single/eval_data/mceval_go_single_v2_chatml.jsonl` | MCEval GoSingle 评测样本的 ChatML 版本，用于 `scripts/benchmark/benchmark_eval.py`。 |
-| `outputs/go_single/models/` | GoSingle 训练出的模型或 LoRA adapter。 |
-| `outputs/go_single/eval_results/` | GoSingle 专用评测结果。 |
-| `outputs/benchmark/go_single_*` | 通用 benchmark evaluator 的 GoSingle/MCEval 输出。 |
-| `outputs/visual_saliency/` | Saliency 可视化 JSON 和 HTML。 |
-| `outputs/saliency_exp/` | Saliency 诊断实验输出。 |
-| `runs/go_single/` | GoSingle 相关日志。 |
+
+| 路径                                                                        | 作用                                                                                                                          |
+| --------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `data/go_single/raw_data/`                                                  | GoSingle 原始数据，包括 CodeSearchNet Go 和 MCEval Go。                                                                       |
+| `data/go_single/train_data/go_single_train_v2_canonical.jsonl`              | 从 CodeSearchNet Go 构建出的 canonical 训练样本，含`prefix`、`target`、`suffix`、`target_kind`。                              |
+| `data/go_single/train_data/go_single_train_v2_chatml.jsonl`                 | canonical 训练样本渲染为 ChatML 后的版本。                                                                                    |
+| `data/go_single/train_data/go_single_train_v2_graphsignal_500_compact.json` | 已标注 500 条 GoSingle 训练数据，是当前 saliency loss 训练的主输入。每行含`input_ids`、`label`、`length`、`attention_edges`。 |
+| `data/go_single/eval_data/mceval_go_single_v2_canonical.jsonl`              | 从 MCEval Go 构建出的 canonical 评测样本，含 judge 所需`judge_payload`。                                                      |
+| `data/go_single/eval_data/mceval_go_single_v2_chatml.jsonl`                 | MCEval GoSingle 评测样本的 ChatML 版本，用于`scripts/benchmark/benchmark_eval.py`。                                           |
+| `outputs/go_single/models/`                                                 | GoSingle 训练出的模型或 LoRA adapter。                                                                                        |
+| `outputs/go_single/eval_results/`                                           | GoSingle 专用评测结果。                                                                                                       |
+| `outputs/benchmark/go_single_*`                                             | 通用 benchmark evaluator 的 GoSingle/MCEval 输出。                                                                            |
+| `outputs/visual_saliency/`                                                  | Saliency 可视化 JSON 和 HTML。                                                                                                |
+| `outputs/saliency_exp/`                                                     | Saliency 诊断实验输出。                                                                                                       |
+| `runs/go_single/`                                                           | GoSingle 相关日志。                                                                                                           |
 
 ### 数据构建
 
 相关代码：
 
-| 路径 | 作用 |
-| --- | --- |
-| `scripts/go_single/build_go_single_data.py` | GoSingle 数据构建入口。读取 CodeSearchNet Go 和 MCEval Go，输出 train/eval canonical 与 ChatML 文件。 |
-| `scripts/go_single/go_single_pipeline.py` | 数据构建核心逻辑：函数切片、statement 分类、过滤 test/generated/comment/noisy call、去重、MCEval judge payload 拼接、report 生成。 |
-| `scripts/go_single/oracle_eval_go_single.py` | 用 gold target 做 oracle 评测，检查 GoSingle eval/judge 本身是否可靠。 |
+
+| 路径                                         | 作用                                                                                                                               |
+| -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `scripts/go_single/build_go_single_data.py`  | GoSingle 数据构建入口。读取 CodeSearchNet Go 和 MCEval Go，输出 train/eval canonical 与 ChatML 文件。                              |
+| `scripts/go_single/go_single_pipeline.py`    | 数据构建核心逻辑：函数切片、statement 分类、过滤 test/generated/comment/noisy call、去重、MCEval judge payload 拼接、report 生成。 |
+| `scripts/go_single/oracle_eval_go_single.py` | 用 gold target 做 oracle 评测，检查 GoSingle eval/judge 本身是否可靠。                                                             |
 
 构建 GoSingle 数据：
 
@@ -983,13 +1088,14 @@ python scripts/go_single/oracle_eval_go_single.py \
 
 相关代码：
 
-| 路径 | 作用 |
-| --- | --- |
-| `src/annotate/utils.py` | 标注基础工具：代码 tokenization、BPE 映射、FIM annotation edge 方向归一化。 |
-| `src/annotate/neural_annot.py` | GraphSignal 标注核心：结构边、LLM/teacher 语义边、OpenAI-compatible API 调用、edge 合并。 |
-| `src/annotate/viz_utils.py` | annotation edge 静态可视化函数。 |
-| `tools/visual_annotation/annotate_benchmark_fim_train.py` | 对 ChatML-FIM 训练样本做 annotation，输出紧凑训练格式。 |
-| `tools/visual_annotation/build_dynamic_annotation_viewer.py` | 构建 annotation edge 动态 HTML viewer。 |
+
+| 路径                                                         | 作用                                                                                      |
+| ------------------------------------------------------------ | ----------------------------------------------------------------------------------------- |
+| `src/annotate/utils.py`                                      | 标注基础工具：代码 tokenization、BPE 映射、FIM annotation edge 方向归一化。               |
+| `src/annotate/neural_annot.py`                               | GraphSignal 标注核心：结构边、LLM/teacher 语义边、OpenAI-compatible API 调用、edge 合并。 |
+| `src/annotate/viz_utils.py`                                  | annotation edge 静态可视化函数。                                                          |
+| `tools/visual_annotation/annotate_benchmark_fim_train.py`    | 对 ChatML-FIM 训练样本做 annotation，输出紧凑训练格式。                                   |
+| `tools/visual_annotation/build_dynamic_annotation_viewer.py` | 构建 annotation edge 动态 HTML viewer。                                                   |
 
 对 500 条 GoSingle 训练样本做 annotation。这个命令需要 API key，且耗时较长：
 
@@ -1035,12 +1141,13 @@ python tools/visual_annotation/build_dynamic_annotation_viewer.py \
 
 相关代码：
 
-| 路径 | 作用 |
-| --- | --- |
-| `src/train/train.py` | 训练主入口。支持 `ce_only`、`ce_saliency`、`saliency_only`。训练结束会保存模型和 `saliency_training_config.json`。 |
-| `src/train/dataset.py` | 读取 GoSingle compact 数据，把 `attention_edges` 转为训练用 `annot_pairs`。 |
-| `src/train/loss.py` | Saliency 与 loss 实现。`softmax` 是 raw saliency softmax loss；`softmax_margin` 是 log-saliency + negative floor 的 softmax-margin loss。 |
-| `src/train/saliency_diagnostics.py` | 训练时详细 saliency 诊断，统计 recall@k、precision@k、mAP@k 和 query/edge 级数据。 |
+
+| 路径                                | 作用                                                                                                                                      |
+| ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/train/train.py`                | 训练主入口。支持`ce_only`、`ce_saliency`、`saliency_only`。训练结束会保存模型和 `saliency_training_config.json`。                         |
+| `src/train/dataset.py`              | 读取 GoSingle compact 数据，把`attention_edges` 转为训练用 `annot_pairs`。                                                                |
+| `src/train/loss.py`                 | Saliency 与 loss 实现。`softmax` 是 raw saliency softmax loss；`softmax_margin` 是 log-saliency + negative floor 的 softmax-margin loss。 |
+| `src/train/saliency_diagnostics.py` | 训练时详细 saliency 诊断，统计 recall@k、precision@k、mAP@k 和 query/edge 级数据。                                                        |
 
 CE baseline：
 
@@ -1177,13 +1284,14 @@ python src/train/train.py \
 
 相关代码：
 
-| 路径 | 作用 |
-| --- | --- |
+
+| 路径                                                                   | 作用                                                                                                       |
+| ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
 | `tools/visual_saliency/compute_teacher_forcing_annotation_saliency.py` | 对 base 和 SFT model 做 teacher-forcing saliency 计算，输出 recall@k、precision@k、mAP@k 和 top-k source。 |
-| `tools/visual_saliency/build_base_vs_ours_annotation_viewer.py` | 把 saliency JSON 渲染成单文件 HTML viewer。 |
-| `scripts/saliency_exp/base_saliency_distribution.py` | 统计 base model 在 500 个样本上的初始 saliency 分布。 |
-| `scripts/saliency_exp/trace_row_token_training.py` | 正常训练 500 样本，同时追踪某个样本/某个 token 的 loss、梯度和 top-k saliency 变化。 |
-| `scripts/saliency_exp/render_row_token_trace_report.py` | 把 trace JSONL 渲染成可读 Markdown / txt。 |
+| `tools/visual_saliency/build_base_vs_ours_annotation_viewer.py`        | 把 saliency JSON 渲染成单文件 HTML viewer。                                                                |
+| `scripts/saliency_exp/base_saliency_distribution.py`                   | 统计 base model 在 500 个样本上的初始 saliency 分布。                                                      |
+| `scripts/saliency_exp/trace_row_token_training.py`                     | 正常训练 500 样本，同时追踪某个样本/某个 token 的 loss、梯度和 top-k saliency 变化。                       |
+| `scripts/saliency_exp/render_row_token_trace_report.py`                | 把 trace JSONL 渲染成可读 Markdown / txt。                                                                 |
 
 生成训练前后 saliency 对齐数据：
 
@@ -1274,14 +1382,15 @@ python scripts/saliency_exp/render_row_token_trace_report.py \
 
 相关代码：
 
-| 路径 | 作用 |
-| --- | --- |
-| `scripts/benchmark/benchmark_eval.py` | 通用 benchmark 评测入口。模型先 greedy 生成得到 pass@1，再采样 `num_samples` 个候选统计 pass@10；可选计算 greedy CodeBLEU。 |
-| `scripts/benchmark/eval_generation.py` | 生成逻辑，包括 greedy generation、sample generation、上下文长度处理。 |
-| `scripts/benchmark/eval_judges.py` | judge 逻辑，根据数据集和语言执行测试。 |
-| `scripts/benchmark/eval_reporting.py` | pass@1/pass@10 聚合和 Markdown/CSV 表格输出。 |
-| `scripts/benchmark/merge_benchmark_eval.py` | 合并 sharded benchmark 输出。 |
-| `scripts/go_single/evaluate_go_single_predictions.py` | GoSingle 专用 prediction JSONL 评测入口。如果已经有外部生成文件，可以直接统计 pass@1、pass@k、CodeBLEU。 |
+
+| 路径                                                  | 作用                                                                                                                       |
+| ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `scripts/benchmark/benchmark_eval.py`                 | 通用 benchmark 评测入口。模型先 greedy 生成得到 pass@1，再采样`num_samples` 个候选统计 pass@10；可选计算 greedy CodeBLEU。 |
+| `scripts/benchmark/eval_generation.py`                | 生成逻辑，包括 greedy generation、sample generation、上下文长度处理。                                                      |
+| `scripts/benchmark/eval_judges.py`                    | judge 逻辑，根据数据集和语言执行测试。                                                                                     |
+| `scripts/benchmark/eval_reporting.py`                 | pass@1/pass@10 聚合和 Markdown/CSV 表格输出。                                                                              |
+| `scripts/benchmark/merge_benchmark_eval.py`           | 合并 sharded benchmark 输出。                                                                                              |
+| `scripts/go_single/evaluate_go_single_predictions.py` | GoSingle 专用 prediction JSONL 评测入口。如果已经有外部生成文件，可以直接统计 pass@1、pass@k、CodeBLEU。                   |
 
 用通用 evaluator 跑 MCEval GoSingle，记录 pass@1、pass@10、CodeBLEU：
 
