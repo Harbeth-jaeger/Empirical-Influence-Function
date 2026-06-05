@@ -43,7 +43,7 @@ def _rate_limited_chat_completion(client: OpenAI, **kwargs):
     min_interval = float(os.environ.get("ANNOTATE_MIN_REQUEST_INTERVAL", "1.2"))
     max_retries = int(os.environ.get("ANNOTATE_MAX_RETRIES", "8"))
     base_sleep = float(os.environ.get("ANNOTATE_RETRY_BASE_SLEEP", "10"))
-    request_timeout = os.environ.get("ANNOTATE_REQUEST_TIMEOUT", "120")
+    request_timeout = os.environ.get("ANNOTATE_REQUEST_TIMEOUT")
     if request_timeout and "timeout" not in kwargs:
         kwargs["timeout"] = float(request_timeout)
 
@@ -961,7 +961,6 @@ class AnnotatorAgent:
         target_indices: set[int] | None = None,
         ts_code: str | None = None,
         ts_char_offset: int = 0,
-        extra_task_instruction: str | None = None,
     ) -> list[TokenCorrelation]:
         """
         Annotate token correlations for ``code``.
@@ -1076,12 +1075,10 @@ class AnnotatorAgent:
             "  - Quantity matters: more correct edges = better annotation.\n"
         )
 
-        extra = f"\n\nAdditional task constraints:\n{extra_task_instruction.strip()}" if extra_task_instruction else ""
         user = (
             f"Code:\n```{self.language}\n{ts_code if ts_code is not None else code}\n```\n\n"
             "Step 1: Call get_structural_edges to seed the structural edges.\n"
             "Then systematically find ALL dataflow, semantic, and api edges."
-            f"{extra}"
         )
 
         messages = [
@@ -1090,16 +1087,13 @@ class AnnotatorAgent:
         ]
         final_pairs = []
 
-        tool_choice = os.environ.get("ANNOTATE_TOOL_CHOICE", "").strip()
         for _ in range(self.max_rounds):
-            request_kwargs = {
-                "model": self.model,
-                "tools": self.TOOLS,
-                "messages": messages,
-            }
-            if tool_choice:
-                request_kwargs["tool_choice"] = tool_choice
-            response = _rate_limited_chat_completion(self.client, **request_kwargs)
+            response = _rate_limited_chat_completion(
+                self.client,
+                model=self.model,
+                tools=self.TOOLS,
+                messages=messages,
+            )
             msg = response.choices[0].message
             messages.append(msg)
 

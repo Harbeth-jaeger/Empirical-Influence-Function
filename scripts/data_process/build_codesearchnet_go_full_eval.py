@@ -12,7 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
-from scripts.go_single.go_single_pipeline import (
+from scripts.go_singleline_fim_exp.go_single_pipeline import (
     BuildStats,
     should_reject_codesearchnet_row,
     find_function_slice,
@@ -157,7 +157,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build full CodeSearchNet-Go valid/test single-statement eval data.")
     parser.add_argument("--raw-root", type=Path, default=Path("data/go_single/raw_data/codesearchnet/go/final/jsonl"))
     parser.add_argument("--output-dir", type=Path, default=Path("data/go_single/eval_data"))
-    parser.add_argument("--report-dir", type=Path, default=Path("outputs/go_single/reports"))
+    parser.add_argument("--report-dir", type=Path, default=Path("outputs/go_singleline_fim_exp/reports"))
     parser.add_argument("--splits", default="valid,test")
     return parser.parse_args()
 
