@@ -924,6 +924,132 @@ class AnnotatorAgent:
         },
     ]
 
+    def _extract_pairs_from_text(self, text: str) -> list[dict]:
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start < 0 or end <= start:
+                return []
+            try:
+                parsed = json.loads(text[start:end + 1])
+            except json.JSONDecodeError:
+                return []
+        if isinstance(parsed, list):
+            return parsed
+        if isinstance(parsed, dict):
+            for key in ("pairs", "edges", "annotations", "correlations"):
+                value = parsed.get(key)
+                if isinstance(value, list):
+                    return value
+        return []
+
+    def _annotate_without_tools(
+        self,
+        code: str,
+        subwords: list[SubwordToken],
+        target_indices: set[int] | None = None,
+        ts_code: str | None = None,
+        ts_char_offset: int = 0,
+    ) -> list[TokenCorrelation]:
+        """Fallback for hosted APIs that reject OpenAI tool calling.
+
+        It preserves the original src.annotate design as much as possible:
+        deterministic tree-sitter edges are still seeded locally, and the LLM is
+        asked once to add dataflow/semantic/api edges as plain JSON.
+        """
+        indexed = {i: sw.surface for i, sw in enumerate(subwords)}
+        parse_text = ts_code if ts_code is not None else code
+        structural_edges = self._syntactic_tool.get_edges(
+            parse_text,
+            subwords,
+            self.language,
+            char_offset=ts_char_offset,
+        )
+        final_pairs = [
+            {"i": e.token_i_idx, "j": e.token_j_idx, "reason": e.reason}
+            for e in structural_edges
+        ]
+        structural_keys = {(p["i"], p["j"], p["reason"]) for p in final_pairs}
+
+        if target_indices is None:
+            candidate_indices = list(indexed)
+        else:
+            candidate_indices = [i for i in sorted(target_indices) if i in indexed]
+        token_payload = [[i, indexed[i]] for i in candidate_indices]
+
+        system = (
+            f"You are a {self.language} code analysis expert specializing in token-level dependency analysis. "
+            "Return JSON only, no markdown. Schema: "
+            "{\"pairs\":[{\"i\":0,\"j\":1,\"reason\":\"dataflow\"}]}. "
+            "Allowed reasons: bracket, defuse, call, return, type, dataflow, semantic, api. "
+            "An edge i->j means token i helps predict token j. Use exact integer token indices. "
+            "Do not repeat seeded_structural_edges. Prefer direct, high-confidence edges."
+        )
+        user = json.dumps(
+            {
+                "code": parse_text,
+                "indexed_tokens": token_payload,
+                "seeded_structural_edges": final_pairs,
+                "task": (
+                    "Add missing dataflow, semantic, and api token dependency edges. "
+                    "Be especially careful with variable/value flow, call arguments/results, return values, "
+                    "types to variables, and API/library usage. Return at most 128 new pairs."
+                ),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        try:
+            response = _rate_limited_chat_completion(
+                self.client,
+                model=self.model,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                temperature=0,
+                max_tokens=int(os.environ.get("ANNOTATE_MAX_TOKENS", "2048")),
+                response_format={"type": "json_object"},
+            )
+        except Exception:
+            response = _rate_limited_chat_completion(
+                self.client,
+                model=self.model,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                temperature=0,
+                max_tokens=int(os.environ.get("ANNOTATE_MAX_TOKENS", "2048")),
+            )
+
+        msg = response.choices[0].message
+        content = getattr(msg, "content", "") or ""
+        for pair in self._extract_pairs_from_text(content):
+            try:
+                i = int(pair.get("i", pair.get("src", pair.get("source"))))
+                j = int(pair.get("j", pair.get("dst", pair.get("target"))))
+                reason = str(pair.get("reason", pair.get("subtype", "semantic"))).lower()
+            except Exception:
+                continue
+            if reason not in {"bracket", "defuse", "call", "return", "type", "dataflow", "semantic", "api"}:
+                reason = "semantic"
+            key = (i, j, reason)
+            if key not in structural_keys:
+                final_pairs.append({"i": i, "j": j, "reason": reason})
+                structural_keys.add(key)
+
+        _VALID_SUBTYPES = {"bracket", "defuse", "call", "return", "type", "dataflow", "semantic", "api"}
+        return [
+            TokenCorrelation(
+                token_i=indexed.get(p["i"], ""),
+                token_j=indexed.get(p["j"], ""),
+                source="NeuralNoTools",
+                subtype=p.get("reason", "semantic") if p.get("reason") in _VALID_SUBTYPES else "semantic",
+                token_i_idx=p["i"],
+                token_j_idx=p["j"],
+            )
+            for p in final_pairs
+            if p["i"] in indexed and p["j"] in indexed and p["i"] != p["j"]
+            and (target_indices is None or (p["i"] in target_indices and p["j"] in target_indices))
+        ]
+
     def _execute_tool(self, name: str, inputs: dict, code: str,
                       subwords: list[SubwordToken],
                       ts_code: str | None = None,
@@ -1088,12 +1214,24 @@ class AnnotatorAgent:
         final_pairs = []
 
         for _ in range(self.max_rounds):
-            response = _rate_limited_chat_completion(
-                self.client,
-                model=self.model,
-                tools=self.TOOLS,
-                messages=messages,
-            )
+            try:
+                response = _rate_limited_chat_completion(
+                    self.client,
+                    model=self.model,
+                    tools=self.TOOLS,
+                    messages=messages,
+                )
+            except Exception as exc:
+                text = str(exc).lower()
+                if "tool choice" in text or "tool_call" in text or "tools" in text:
+                    return self._annotate_without_tools(
+                        code,
+                        subwords,
+                        target_indices=target_indices,
+                        ts_code=ts_code,
+                        ts_char_offset=ts_char_offset,
+                    )
+                raise
             msg = response.choices[0].message
             messages.append(msg)
 

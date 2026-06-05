@@ -5,6 +5,7 @@ import argparse
 import copy
 import dataclasses
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -777,14 +778,31 @@ def annotate_row(row: dict[str, Any], tokenizer: Any, max_len: int, max_rounds: 
         )
     else:
         agent = AnnotatorAgent(language=language, max_rounds=max_rounds)
-        correlations = agent.annotate(
-            filled,
-            simple_tokens,
-            target_indices=target_indices,
-            ts_code=ts_code,
-            ts_char_offset=ts_char_offset,
-            extra_task_instruction=extra_task_instruction,
+        annotate_kwargs = {
+            "target_indices": target_indices,
+            "ts_code": ts_code,
+            "ts_char_offset": ts_char_offset,
+        }
+        if "extra_task_instruction" in inspect.signature(agent.annotate).parameters:
+            annotate_kwargs["extra_task_instruction"] = extra_task_instruction
+        correlations = agent.annotate(filled, simple_tokens, **annotate_kwargs)
+
+    completion_set = set(completion_indices)
+    has_completion_edge = any(
+        int(c.token_j_idx) in completion_set and int(c.token_i_idx) != int(c.token_j_idx)
+        for c in correlations
+    )
+    if not has_completion_edge:
+        correlations = dedupe_correlations(
+            list(correlations)
+            + local_completion_bridge_edges(
+                simple_tokens=simple_tokens,
+                correlations=list(correlations),
+                completion_indices=completion_indices,
+                code_indices=set(target_indices) if target_indices is not None else None,
+            )
         )
+
     tokens = [to_dict(t) for t in simple_tokens]
     annotations = [to_dict(c) for c in correlations]
     qwen_tokens, raw_qwen_annotations = map_to_qwen_annotations(
