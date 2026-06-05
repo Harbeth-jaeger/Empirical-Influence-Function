@@ -6,6 +6,8 @@ import copy
 import json
 import os
 import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -29,7 +31,58 @@ from scripts.benchmark.apply_governance_operator import (
     add_graphsignal_teacher_annotations,
 )
 from src.annotate.utils import get_token_indices_in_span, tokenize_code_for_annotation
-from src.sft.binarize_data import chatml_format_preprocess, setup_tokenizer
+
+try:
+    from src.sft.binarize_data import chatml_format_preprocess, setup_tokenizer
+except ModuleNotFoundError:
+    def setup_tokenizer(tokenizer: transformers.PreTrainedTokenizer) -> transformers.PreTrainedTokenizer:
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token or "<|endoftext|>"
+        return tokenizer
+
+    def _chatml_text(messages: list[dict[str, Any]]) -> str:
+        parts: list[str] = []
+        for msg in messages:
+            role = str(msg.get("role", "")).strip()
+            content = str(msg.get("content", ""))
+            parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+        return "".join(parts)
+
+    def chatml_format_preprocess(
+        sources: list[dict[str, Any]],
+        tokenizer: transformers.PreTrainedTokenizer,
+        max_len: int,
+        only_last_turn_loss: bool = True,
+    ) -> dict[str, list[int]] | None:
+        text = _chatml_text(sources)
+        enc = tokenizer(text, add_special_tokens=False)
+        input_ids = list(enc.input_ids)
+        if not input_ids or len(input_ids) > max_len:
+            return None
+
+        labels = [IGNORE_INDEX] * len(input_ids)
+        assistant_indices = [i for i, msg in enumerate(sources) if msg.get("role") == "assistant"]
+        if not assistant_indices:
+            return None
+        target_assistants = [assistant_indices[-1]] if only_last_turn_loss else assistant_indices
+
+        cursor = 0
+        for idx, msg in enumerate(sources):
+            role = str(msg.get("role", "")).strip()
+            content = str(msg.get("content", ""))
+            prefix = f"<|im_start|>{role}\n"
+            prefix_ids = tokenizer(prefix, add_special_tokens=False).input_ids
+            content_ids = tokenizer(content, add_special_tokens=False).input_ids
+            content_start = cursor + len(prefix_ids)
+            content_end = content_start + len(content_ids)
+            if idx in target_assistants:
+                labels[content_start:content_end] = input_ids[content_start:content_end]
+            msg_text = f"{prefix}{content}<|im_end|>\n"
+            cursor += len(tokenizer(msg_text, add_special_tokens=False).input_ids)
+
+        if not any(v != IGNORE_INDEX for v in labels):
+            return None
+        return {"input_ids": input_ids, "label": labels, "length": len(input_ids)}
 
 
 IGNORE_INDEX = -100
@@ -39,6 +92,21 @@ DEFAULT_CACHE_PATH = ROOT / "runs/benchmark/curation_data/ours_corr_attn_context
 DEFAULT_MODEL = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 CONTEXT_CACHE_VERSION = "corr_attn_context_v2"
+
+_TEACHER_RATE_LIMIT_LOCK = threading.Lock()
+_TEACHER_LAST_CALL_AT = 0.0
+
+
+def wait_teacher_rate_limit(min_interval_seconds: float) -> None:
+    global _TEACHER_LAST_CALL_AT
+    if min_interval_seconds <= 0:
+        return
+    with _TEACHER_RATE_LIMIT_LOCK:
+        now = time.monotonic()
+        wait = float(min_interval_seconds) - (now - _TEACHER_LAST_CALL_AT)
+        if wait > 0:
+            time.sleep(wait)
+        _TEACHER_LAST_CALL_AT = time.monotonic()
 
 
 def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
@@ -378,6 +446,9 @@ def teacher_context_to_completion_edges(
     max_tokens: int = 768,
     context_chars: int = 6000,
     max_edges: int = 96,
+    min_interval_seconds: float = 0.0,
+    max_retries: int = 0,
+    retry_backoff_seconds: float = 20.0,
 ) -> list[dict[str, Any]]:
     if not api_key or not source_indices or not target_indices:
         return []
@@ -439,19 +510,10 @@ def teacher_context_to_completion_edges(
     }
     user = json.dumps(request_payload, ensure_ascii=False, separators=(",", ":"))
 
-    try:
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0,
-            max_tokens=max_tokens,
-            response_format={"type": "json_object"},
-            extra_body={"thinking": {"type": "disabled"}},
-        )
-    except Exception:
+    response = None
+    last_exc: Exception | None = None
+    for attempt in range(max(0, int(max_retries)) + 1):
+        wait_teacher_rate_limit(min_interval_seconds)
         try:
             response = client.chat.completions.create(
                 model=model_name,
@@ -461,10 +523,34 @@ def teacher_context_to_completion_edges(
                 ],
                 temperature=0,
                 max_tokens=max_tokens,
+                response_format={"type": "json_object"},
+                extra_body={"thinking": {"type": "disabled"}},
             )
+            break
         except Exception as exc:
-            print(f"    [corr_attn.teacher] API error: {exc}")
-            return []
+            last_exc = exc
+            try:
+                wait_teacher_rate_limit(min_interval_seconds)
+                response = client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    temperature=0,
+                    max_tokens=max_tokens,
+                )
+                break
+            except Exception as exc2:
+                last_exc = exc2
+                if attempt < max(0, int(max_retries)):
+                    sleep_s = float(retry_backoff_seconds) * (2 ** attempt)
+                    print(f"    [corr_attn.teacher] API error: {exc2}; retry {attempt + 1}/{max_retries} after {sleep_s:.1f}s")
+                    time.sleep(sleep_s)
+                else:
+                    print(f"    [corr_attn.teacher] API error after retries: {exc2}")
+    if response is None:
+        return []
 
     raw = _extract_chat_message_text(response)
     payload = _parse_teacher_json(raw)
@@ -520,6 +606,9 @@ def add_context_teacher_annotations(
     teacher_context_chars: int,
     source_context_tokens: int,
     teacher_max_edges: int,
+    teacher_min_interval_seconds: float,
+    teacher_max_retries: int,
+    teacher_retry_backoff_seconds: float,
 ) -> list[dict[str, Any]]:
     from src.annotate.neural_annot import SyntacticCheckerTool
 
@@ -577,6 +666,9 @@ def add_context_teacher_annotations(
             max_tokens=teacher_max_tokens,
             context_chars=teacher_context_chars,
             max_edges=teacher_max_edges,
+            min_interval_seconds=teacher_min_interval_seconds,
+            max_retries=teacher_max_retries,
+            retry_backoff_seconds=teacher_retry_backoff_seconds,
         )
         simple_edges = _as_annotation_dicts(structural + neural)
         qwen_edges = map_simple_edges_to_chatml_bpe(
@@ -746,6 +838,9 @@ def parse_args() -> argparse.Namespace:
         default=160,
         help="Max non-completion source-token candidates around the FIM hole for context-aware teacher annotation.",
     )
+    parser.add_argument("--graph_teacher_min_interval_seconds", type=float, default=0.0)
+    parser.add_argument("--graph_teacher_max_retries", type=int, default=0)
+    parser.add_argument("--graph_teacher_retry_backoff_seconds", type=float, default=20.0)
     parser.add_argument("--annotation_cache_path", default=str(DEFAULT_CACHE_PATH))
     parser.add_argument("--no_annotation_cache", action="store_true")
     parser.add_argument("--teacher_overwrite_annotations", action="store_true")
@@ -833,6 +928,9 @@ def main() -> None:
                     teacher_context_chars=args.graph_teacher_context_chars,
                     source_context_tokens=args.graph_teacher_source_context_tokens,
                     teacher_max_edges=args.graph_teacher_max_edges,
+                    teacher_min_interval_seconds=args.graph_teacher_min_interval_seconds,
+                    teacher_max_retries=args.graph_teacher_max_retries,
+                    teacher_retry_backoff_seconds=args.graph_teacher_retry_backoff_seconds,
                 )
             else:
                 annotated_chunk = add_graphsignal_teacher_annotations(

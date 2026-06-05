@@ -1,4 +1,4 @@
-# Benchmark 数据、治理与评测
+## Benchmark 数据、治理与评测
 
 本文整理 benchmark 相关的数据来源、字段对齐、训练/评测使用字段、baseline 分类、当前结果，以及 `scripts/benchmark` 中主要代码文件的作用。
 
@@ -387,34 +387,339 @@ Gold Oracle 使用数据里的 `fim_completion` 作为 prediction，只检查拼
 
 # Benchmark V2
 
-## 数据获取与处理
+## train data
 
 benchmarkV2 数据路线：
 
 - 数据获取：
-    - train 使用 CodeSearchNet Go：`data/go_single/raw_data/codesearchnet`，原始规模约 317K。
-    - test 只使用 MCEval Go：`data/go_single/raw_data/mceval`，原始规模约 400。不要额外构造 CodeSearchNet heldout eval，避免评测口径分散。
-    - MCEval 的 `completion/single` 不是我们定义的 singleline/single-statement，它更接近 single mask/span，很多样本实际是多行或控制流片段。因此 test 侧不要直接相信原始 `[MASK]`，而是从 `prompt + canonical_solution` 中重新抽取干净的 single statement，并保留原始 `test / entry_point / task_id` 用于评测。
 
+  - train 使用 CodeSearchNet Go：`data/go_single/raw_data/codesearchnet`，原始规模约 317K。
+  - test 只使用 MCEval Go：`data/go_single/raw_data/mceval`，原始规模约 400。不要额外构造 CodeSearchNet heldout eval，避免评测口径分散。
+  - MCEval 的 `completion/single` 不是我们定义的 singleline/single-statement，它更接近 single mask/span，很多样本实际是多行或控制流片段。因此 test 侧不要直接相信原始 `[MASK]`，而是从 `prompt + canonical_solution` 中重新抽取干净的 single statement，并保留原始 `test / entry_point / task_id` 用于评测。
 - 清洗过滤：
-    - 文件级过滤：拒绝 `_test.go`，拒绝路径包含 `testdata/vendor/mock/mocks/fixture/fixtures/example/examples/generated`，拒绝 `package xxx_test`，拒绝 `import testing`、`testify`、`assert`、`require`，拒绝明显 generated file，例如 `Code generated`、`DO NOT EDIT`。
-    - 注释必须严格过滤：函数内部不能有行注释、块注释、docstring 或注释残留；target 语句和 prefix/suffix 所在函数片段都不能包含注释。原因是后续 annotation、saliency 和数据治理依赖代码 token 关系，注释会显著干扰归因和治理。
-    - 函数级过滤：只保留 `function_declaration` / `method_declaration`，函数体必须存在，函数行数和 token 长度控制在短代码范围内，拒绝函数名或内容包含 `Test/Benchmark/Example/assert/require/testcase/expected/actual`。
-    - target 级过滤：只保留完整单行、完整单条 statement；类型限定为 assignment、return、call expression。拒绝 `if/for/switch/select` 等 block header，拒绝包含 `{` 或 `}` 的 target，拒绝空 return、`return nil`、`return err`、`i++`、`continue`、`break`、`panic` 等信息量低或控制流强的 target，拒绝 `fmt.Print`、`log.Print`、测试相关符号。
-    - 去重与泄漏控制：对 `full_code`、函数片段、target 做 exact hash 和 normalized hash 去重；train 侧剔除与 MCEval eval 过近的样本，降低 train-test leakage 风险。
 
+  - 文件级过滤：拒绝 `_test.go`，拒绝路径包含 `testdata/vendor/mock/mocks/fixture/fixtures/example/examples/generated`，拒绝 `package xxx_test`，拒绝 `import testing`、`testify`、`assert`、`require`，拒绝明显 generated file，例如 `Code generated`、`DO NOT EDIT`。
+  - 注释必须严格过滤：函数内部不能有行注释、块注释、docstring 或注释残留；target 语句和 prefix/suffix 所在函数片段都不能包含注释。原因是后续 annotation、saliency 和数据治理依赖代码 token 关系，注释会显著干扰归因和治理。
+  - 函数级过滤：只保留 `function_declaration` / `method_declaration`，函数体必须存在，函数行数和 token 长度控制在短代码范围内，拒绝函数名或内容包含 `Test/Benchmark/Example/assert/require/testcase/expected/actual`。
+  - target 级过滤：只保留完整单行、完整单条 statement；类型限定为 assignment、return、call expression。拒绝 `if/for/switch/select` 等 block header，拒绝包含 `{` 或 `}` 的 target，拒绝空 return、`return nil`、`return err`、`i++`、`continue`、`break`、`panic` 等信息量低或控制流强的 target，拒绝 `fmt.Print`、`log.Print`、测试相关符号。
+  - 去重与泄漏控制：对 `full_code`、函数片段、target 做 exact hash 和 normalized hash 去重；train 侧剔除与 MCEval eval 过近的样本，降低 train-test leakage 风险。
 - singleline 构造：
-    - 对 CodeSearchNet，解析 Go AST，从函数体中遍历候选 statement，选出合法 target；`prefix` 是同一函数片段中 target 前源码，`target` 是该 statement 原文，`suffix` 是 target 后源码，`full_code = prefix + target + suffix`。
-    - 对 MCEval，先构造 `full_code = prompt + canonical_solution`，在 `entry_point` 对应函数内重新选择合法 single statement；`prefix/target/suffix` 由 AST byte span 切分，`judge_payload` 保留原始 `test / entry_point / task_id / raw_mceval`。
-    - prefix/suffix 优先使用函数级片段而不是整文件，保证上下文足够、长度可控、annotation 更干净。
 
+  - 对 CodeSearchNet，解析 Go AST，从函数体中遍历候选 statement，选出合法 target；`prefix` 是同一函数片段中 target 前源码，`target` 是该 statement 原文，`suffix` 是 target 后源码，`full_code = prefix + target + suffix`。
+  - 对 MCEval，先构造 `full_code = prompt + canonical_solution`，在 `entry_point` 对应函数内重新选择合法 single statement；`prefix/target/suffix` 由 AST byte span 切分，`judge_payload` 保留原始 `test / entry_point / task_id / raw_mceval`。
+  - prefix/suffix 优先使用函数级片段而不是整文件，保证上下文足够、长度可控、annotation 更干净。
 - 数据格式：
-    - 第一层保存 canonical schema：`uid/source_dataset/split/language/task_type/prefix/target/suffix/full_code/target_kind/metadata/judge_payload`。这一层是数据真相层，不绑定 ChatML、tokenizer 或具体模型。
-    - 第二层保存 rendered ChatML schema：保留 canonical 字段，并新增 `messages`。`system` 写 Go code completion assistant；`user` 给出带 `[MASK]` 的 Go 代码片段并要求只返回缺失代码；`assistant` 只存 `target`。
-    - 后续 tokenized 训练格式再从 rendered ChatML 生成，`label != -100` 只落在 assistant target 区域，GraphSignal 的 annotation edge target 也应集中到 assistant target token。
 
+  - 第一层保存 canonical schema：`uid/source_dataset/split/language/task_type/prefix/target/suffix/full_code/target_kind/metadata/judge_payload`。这一层是数据真相层，不绑定 ChatML、tokenizer 或具体模型。
+  - 第二层保存 rendered ChatML schema：保留 canonical 字段，并新增 `messages`。`system` 写 Go code completion assistant；`user` 给出带 `[MASK]` 的 Go 代码片段并要求只返回缺失代码；`assistant` 只存 `target`。
+  - 后续 tokenized 训练格式再从 rendered ChatML 生成，`label != -100` 只落在 assistant target 区域，GraphSignal 的 annotation edge target 也应集中到 assistant target token。
 - 评测方式：
-    - 模型使用 Qwen2.5-Coder-7B-Instruct 系列，训练和推理都走 ChatML 格式。
-    - 推理时读取 rendered ChatML eval，去掉 assistant message，让模型生成缺失 target。
-    - MCEval-derived eval 的评测由我们显式拼接 `candidate_code = prefix + prediction + suffix`，再结合原始 `test` 运行 Go judge，统计 pass@1/pass@k 和 CodeBleu 。MCEval 官方评测思想和 judge 逻辑可以参考或复用，但插入位置必须由我们自己控制，因为 benchmarkV2 的 mask 是重新抽取的 single statement，不是 MCEval 原始 mask。
-    - 先写 inspect/build 脚本输出候选统计、reject reason、target_kind 分布、长度分布和随机样本报告；确认样本质量后再生成正式 10K train 和 MCEval clean eval。
+
+  - 模型使用 Qwen2.5-Coder-7B-Instruct 系列，训练和推理都走 ChatML 格式。
+  - 推理时读取 rendered ChatML eval，去掉 assistant message，让模型生成缺失 target。
+  - MCEval-derived eval 的评测由我们显式拼接 `candidate_code = prefix + prediction + suffix`，再结合原始 `test` 运行 Go judge，统计 pass@1/pass@k 和 CodeBleu 。MCEval 官方评测思想和 judge 逻辑可以参考或复用，但插入位置必须由我们自己控制，因为 benchmarkV2 的 mask 是重新抽取的 single statement，不是 MCEval 原始 mask。
+  - 先写 inspect/build 脚本输出候选统计、reject reason、target_kind 分布、长度分布和随机样本报告；确认样本质量后再生成正式 10K train 和 MCEval clean eval。
+
+## Internal test data
+
+Internal test 主要用于和当前 Go single-statement 训练任务保持同分布，核心目标不是追求外部 benchmark 权威性，而是回答：
+
+```text
+模型在我们自己的 Go function-level completion 数据分布上，completion 质量和 saliency alignment 是否提升？
+```
+
+### 1. 数据来源与定位
+
+当前 internal test 使用 CodeSearchNet Go heldout 数据构造，原始数据来自：
+
+```text
+data/go_single/raw_data/codesearchnet/go/final/jsonl
+```
+
+构造后的 eval 数据放在：
+
+```text
+data/go_single/eval_data/
+```
+
+已构造过的代表性文件包括：
+
+```text
+data/go_single/eval_data/codesearchnet_go_valid_1000_chatml.jsonl
+data/go_single/eval_data/codesearchnet_go_test_1000_chatml.jsonl
+data/go_single/eval_data/codesearchnet_go_test_1000_graphsignal_500_compact.json
+```
+
+这里的 CodeSearchNet internal test 没有 unit test / judge payload，因此不能报告真正意义上的 pass@k。它适合报告：
+
+```text
+CodeBLEU
+Exact Match@1/@k
+Edit Similarity
+parse/gofmt success rate
+saliency Recall@10
+saliency Precision@10
+saliency mAP@10
+```
+
+其中 saliency 指标只对已经有 GraphSignal annotation edge 的样本计算。
+
+### 2. 清洗与过滤
+
+Internal test 沿用 train 侧 Go single-statement 构造逻辑，但 split 必须和训练数据分开：
+
+- 拒绝 `_test.go`、`testdata/vendor/mock/fixture/example/generated` 等测试、mock、样例、生成代码。
+- 拒绝 `package xxx_test`、`import testing`、`testify/assert/require` 等测试相关样本。
+- 只保留 Go function / method 内部的单行、单 statement target。
+- target 优先保留 assignment、return、call expression 等信息量较高的语句。
+- 拒绝 `return nil`、`return err`、`break/continue/panic`、简单自增等弱信息 target。
+- 对 `full_code`、函数片段、target 做 exact / normalized 去重。
+
+Internal test 的目标是形成干净、可解释、和训练任务一致的 Go completion 分布；它不是外部论文 benchmark，因此结果应该标注为 internal data。
+
+### 3. 格式转换
+
+保持两层格式：
+
+```text
+canonical schema:
+uid/source_dataset/split/language/task_type/prefix/target/suffix/full_code/metadata/judge_payload
+```
+
+```text
+rendered ChatML schema:
+uid/source_dataset/split/language/messages/prefix/target/suffix/full_code/metadata/judge_payload
+```
+
+对模型推理，`messages` 只保留 system + user，不喂 assistant target。user prompt 使用当前 Go completion 模板：
+
+```text
+Fill the [MASK] in the Go function. Return only the missing Go code.
+```
+
+### 4. 评测方式
+
+Internal test 的 completion 质量不报告 pass@k，除非样本明确带有可执行 judge。当前 CodeSearchNet internal test 的推荐主表：
+
+
+| Metric              | 含义                                                                     |
+| ------------------- | ------------------------------------------------------------------------ |
+| `CodeBLEU`          | 与 gold target 的代码相似度。                                            |
+| `Exact Match@1/@10` | 预测 target 规范化后是否与 gold 完全一致。                               |
+| `Edit Similarity`   | 基于编辑距离的字符串相似度。                                             |
+| `Parse/gofmt rate`  | 预测拼回`prefix + prediction + suffix` 后是否能被 Go parser/gofmt 接受。 |
+| `Recall@10`         | saliency top-10 是否覆盖 annotation source。                             |
+| `Precision@10`      | saliency top-10 中 annotation source 占比。                              |
+| `mAP@10`            | annotation source 在 saliency 排名中的平均精度。                         |
+
+需要注意：Exact Match 不是 pass@k。CodeSearchNet 没有 unit test，不能用“至少一个生成能通过测试”定义 pass@k。
+
+## External test benchmark
+
+External test 主要用于补足外部权威 benchmark。这里不要强行要求 Go 语言；benchmark 的语言由 benchmark 本身决定。当前优先考虑三个 completion 领域常用 benchmark：
+
+```text
+CodeXGLUE Code Completion
+RepoBench
+CrossCodeEval
+```
+
+### 1. 总览
+
+
+| Benchmark                 | 语言                         | 任务形态                              | 是否有 unit test | 推荐报告指标                             | 优先级 |
+| ------------------------- | ---------------------------- | ------------------------------------- | ---------------- | ---------------------------------------- | ------ |
+| CodeXGLUE Code Completion | Python, Java                 | token-level / line-level completion   | 否               | EM, Edit Similarity                      | S      |
+| RepoBench                 | Python, Java                 | repository-level next-line completion | 否               | EM, Edit Similarity, CodeBLEU            | A      |
+| CrossCodeEval             | Python, Java, TypeScript, C# | cross-file code completion            | 否               | EM, Edit Similarity, Identifier Match/F1 | A      |
+
+这三个 benchmark 都不是 execution benchmark，因此默认不报告 pass@k。pass@k 只适合 HumanEval、McEval、SAFIM、xCodeEval 这类带 unit test 或 judge payload 的数据。
+
+### 2. CodeXGLUE Code Completion
+
+CodeXGLUE completion 是传统 code completion 最稳的公开基准之一。completion 主体包含：
+
+```text
+PY150
+GitHub Java Corpus
+```
+
+任务包括 token-level 和 line-level。对于 Qwen-Instruct 这类生成式模型，优先使用 line-level completion。
+
+数据获取：
+
+```text
+data/go_single/raw_data/codexglue/CodeXGLUE
+```
+
+推荐只 sparse checkout completion 相关目录：
+
+```bash
+git clone --depth 1 --filter=blob:none --sparse \
+  https://github.com/microsoft/CodeXGLUE \
+  data/go_single/raw_data/codexglue/CodeXGLUE
+
+cd data/go_single/raw_data/codexglue/CodeXGLUE
+git sparse-checkout set Code-Code/CodeCompletion-line Code-Code/CodeCompletion-token
+```
+
+处理原则：
+
+- 不修改官方 `test.json` / `answers.json`。
+- 只生成我们自己的 rendered ChatML eval 文件。
+- 保留官方 raw id，便于 prediction 和 answer 对齐。
+- 对 prompt 超长样本单独记录 skip reason，不在原始 benchmark 文件上改动。
+
+建议输出：
+
+```text
+data/go_single/eval_data/codexglue_py150_line_chatml.jsonl
+data/go_single/eval_data/codexglue_java_line_chatml.jsonl
+outputs/go_single/codexglue/predictions/
+outputs/go_single/codexglue/results/
+```
+
+评测：
+
+- 优先调用 CodeXGLUE 官方 evaluator。
+- line-level completion 主报告 EM 和 Edit Similarity。
+- CodeBLEU 可作为补充，但不要替代官方指标。
+
+### 3. RepoBench
+
+RepoBench 是 ICLR 2024 repository-level code auto-completion benchmark，更接近真实 IDE 场景。支持语言：
+
+```text
+Python
+Java
+```
+
+主要 setting：
+
+
+| Setting             | 含义                                   |
+| ------------------- | -------------------------------------- |
+| `in_file`           | 预测不依赖跨文件信息的当前文件下一行。 |
+| `cross_file_first`  | mask 第一次使用跨文件模块的行。        |
+| `cross_file_random` | mask 随机跨文件依赖行。                |
+
+数据获取：
+
+```text
+tianyang/repobench_python_v1.1
+tianyang/repobench_java_v1.1
+```
+
+同时 clone 官方 repo，保留 `eval.py`：
+
+```text
+data/go_single/raw_data/repobench_repo
+```
+
+处理方式：
+
+- 使用 HuggingFace `datasets.load_dataset` 拉取 Python/Java v1.1。
+- 原始 dataset 保存在 `data/go_single/raw_data/repobench/`。
+- 不改官方字段，只生成我们的 ChatML rendered copy。
+- prompt 由 cross-file context、import statement、cropped code 组成。
+- target 是官方 `next_line`。
+- 生成时只取下一行，避免模型继续生成后续多行污染 EM。
+
+建议输出：
+
+```text
+data/go_single/eval_data/repobench_python_chatml.jsonl
+data/go_single/eval_data/repobench_java_chatml.jsonl
+outputs/go_single/repobench/predictions/
+outputs/go_single/repobench/results/
+```
+
+评测：
+
+- 调用 RepoBench 官方 `eval.py`。
+- 按 language / setting / level 聚合。
+- 主报告 EM、Edit Similarity、CodeBLEU。
+- 不报告 pass@k，因为 RepoBench 没有 unit test。
+
+今晚优先级：先跑 RepoBench Python subset，每个 setting 各取 200-500 条，确认 pipeline 后再扩到 Java 和全量。
+
+### 4. CrossCodeEval
+
+CrossCodeEval 是 NeurIPS 2023 Datasets & Benchmarks 的 cross-file code completion benchmark。支持语言：
+
+```text
+Python
+Java
+TypeScript
+C#
+```
+
+它的重点是：样本需要跨文件上下文才能完成，适合评估模型是否能利用 retrieved context。
+
+官方 setting 包括：
+
+
+| Setting                      | 含义                                                                         |
+| ---------------------------- | ---------------------------------------------------------------------------- |
+| in-file only                 | 只给当前文件上下文。                                                         |
+| retrieved cross-file context | 给检索到的跨文件上下文。                                                     |
+| retrieval with reference     | 使用 reference 辅助检索，主要作为 retrieval 上界，不适合作为真实模型主结果。 |
+
+数据获取：
+
+```text
+data/go_single/raw_data/crosscodeeval_repo
+```
+
+处理方式：
+
+- clone `amazon-science/cceval`。
+- 解压官方 crosscodeeval 数据。
+- 不修改官方 prompt / reference。
+- 生成我们的 ChatML rendered copy。
+- prompt 保留官方 in-file context 和 retrieved cross-file context。
+- target 使用官方 reference completion。
+
+建议输出：
+
+```text
+data/go_single/eval_data/crosscodeeval_python_chatml.jsonl
+data/go_single/eval_data/crosscodeeval_java_chatml.jsonl
+data/go_single/eval_data/crosscodeeval_typescript_chatml.jsonl
+data/go_single/eval_data/crosscodeeval_csharp_chatml.jsonl
+outputs/go_single/crosscodeeval/predictions/
+outputs/go_single/crosscodeeval/results/
+```
+
+评测：
+
+- 优先调用 CrossCodeEval 官方评测脚本。
+- 主报告 code match：EM、Edit Similarity。
+- 同时报告 identifier match：Identifier Precision / Recall / F1。
+- 不报告 pass@k，因为 CrossCodeEval 没有 unit test。
+
+今晚优先级：先跑 Python，必要时再加 Java；TypeScript/C# 依赖 parser/tokenizer 环境更多，放到后续补齐。
+
+### 5. 当前推荐实验顺序
+
+在时间紧张的情况下，推荐顺序：
+
+```text
+1. Internal CodeSearchNet-Go: CodeBLEU + saliency metrics
+2. CodeXGLUE PY150 line-level: EM + Edit Similarity
+3. RepoBench Python subset: EM + Edit Similarity + CodeBLEU
+4. CrossCodeEval Python retrieved-context: EM + ES + Identifier F1
+```
+
+最终报告中应明确区分：
+
+```text
+Internal data:
+  同分布 Go completion，主要看 CodeBLEU 和 saliency alignment。
+
+External benchmark:
+  权威 completion benchmark，主要看 EM / ES / CodeBLEU / Identifier F1。
+
+Execution benchmark:
+  只有带 judge/unit test 的数据才能报告 pass@k。
+```

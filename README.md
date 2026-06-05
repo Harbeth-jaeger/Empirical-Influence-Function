@@ -1,5 +1,7 @@
 # 项目概览
 
+# 项目概览
+
 我正在进行一个名为“Qwen 代码语言模型训练”的项目，项目信息如下
 
 Train (模型训练与识别错题) → Attribution (双线归因：找错因与找错题来源) → Curation (数据治理与损失干预) 这三步走战略
@@ -294,81 +296,9 @@ non-annotation causal source 为：
 * **\\alpha**：margin，要求标注边贡献至少比非标注边高到一定比例。
 * **\\varepsilon**：防止分母为零。
 
-#### loss v3
-
-对某个 query token **q**，定义它的 annotation source 集合为：
-
-**A\_q = \\{s \\mid s \\rightarrow q \\text{ is an annotation edge},\\ s < q\\}**
-
-所有 causal source 集合为：
-
-**M\_q = \\{s \\mid s < q\\}**
-
-非 annotation source 集合为：
-
-**N\_q = M\_q \\setminus A\_q**
-
-新版 loss 先把 saliency 转成 log-score：
-
-**r\_{q,s} = \\log(C\_{q,s} + \\epsilon\_{\\text{reg}})**
-
-然后用 temperature **\\tau** 缩放：
-
-**\\ell\_{q,s} = \\frac{r\_{q,s}}{\\tau}**
-
-在所有 causal source 上做 softmax：
-
-**p\_{q,s} = \\frac{ \\exp(\\ell\_{q,s}) }{ \\sum\_{r \\in M\_q} \\exp(\\ell\_{q,r})}**
-
-对于一个 query **q**，multi-positive loss 是：
-
-**\\mathcal{L}\_q = - \\frac{1}{|A\_q|} \\sum\_{s \\in A\_q} \\log p\_{q,s}**
-
-总 saliency loss 是：
-
-**\\mathcal{L}\_{sal} = \\frac{1}{|Q|} \\sum\_{q \\in Q} \\mathcal{L}\_q**
-
-其中 **Q** 是满足下面条件的 query token 集合：
-
-**|A\_q| > 0 \\quad \\text{and} \\quad |N\_q| > 0**
-
-#### loss v4
-
-对某个 query token **q**，定义它的 annotation source 集合为：
-
-**A\_q = \\{s \\mid s \\rightarrow q \\text{ is an annotation edge},\\ s < q\\}**
-
-所有 causal source 集合为：
-
-**M\_q = \\{s \\mid s < q\\}**
-
-非 annotation source 集合为：
-
-**N\_q = M\_q \\setminus A\_q**
-
-然后用 temperature **\\tau** 缩放：
-
-**\\ell\_{q,s} = \\frac{C\_{q,s}}{\\tau}**
-
-在所有 causal source 上做 softmax：
-
-**p\_{q,s} = \\frac{ \\exp(\\ell\_{q,s}) }{ \\sum\_{r \\in M\_q} \\exp(\\ell\_{q,r})}**
-
-对于一个 query **q**，multi-positive loss 是：
-
-**\\mathcal{L}\_q = - \\frac{1}{|A\_q|} \\sum\_{s \\in A\_q} \\log p\_{q,s}**
-
-总 saliency loss 是：
-
-**\\mathcal{L}\_{sal} = \\frac{1}{|Q|} \\sum\_{q \\in Q} \\mathcal{L}\_q**
-
-其中 **Q** 是满足下面条件的 query token 集合：
-
-**|A\_q| > 0 \\quad \\text{and} \\quad |N\_q| > 0**
-
 #### 最新 loss 设计
 
-InfoNCE / multi-positive NLL。
+新版 loss 现在不是 hinge loss，而是 InfoNCE / multi-positive NLL。
 
 对某个 query token **q**，定义它的 annotation source 集合为：
 
@@ -384,17 +314,19 @@ InfoNCE / multi-positive NLL。
 
 新版 loss 先把 saliency 转成 log-score：
 
-**r\_{q,s} = \\log(C\_{q,s} + \\epsilon\_{\\text{reg}})**
+**r\_{q,s} = \\log(C\_{q,s} + \\epsilon)**
 
 然后用 temperature **\\tau** 缩放：
 
 **\\ell\_{q,s} = \\frac{r\_{q,s}}{\\tau}**
 
+代码里这个 **\\tau** 仍然叫 `alpha`，所以要注意：现在 `alpha` 不是 margin，而是 temperature。
+
 在所有 causal source 上做 softmax：
 
-**p\_{q,s} = \\frac{ \\exp(\\ell\_{q,s}) }{\\sum\_{r \\in N\_q} \\exp(\\max(\\ell\_{q,r},\\epsilon))+\\exp(\\ell\_{q,s}) }**
+**p\_{q,s} = \\frac{ \\exp(\\ell\_{q,s}) }{ \\sum\_{r \\in N\_q} \\exp(\\max(\\ell\_{q,r},\\epsilon))+\\exp(\\ell\_{q,s}) }**
 
-其中，eps 相当于负样本 floor，决定了负样本最低有多强，从数学形式上解析，eps 越大，对 neg 的惩罚力度越小。因此 eps 是关键超参数，影响到 loss 对负样本的打压力度
+经过实验结果验证可知，此处 **\\epsilon** 最优值为 **M\_q** 集合的sal 75 quantile，具体计算方式为，ce loss训练后模型对样本前向传播，计算所有存在annotation source的q token的相关causal source的sal，排序得到75 quantile的数值，即为eps
 
 对于一个 query **q**，multi-positive loss 是：
 
@@ -411,41 +343,6 @@ InfoNCE / multi-positive NLL。
 直观理解就是：
 
 对每个 target token **q**，把所有前文 causal token 都作为候选 source，让 annotation source 在 softmax 分布里获得更高概率。它不只是要求 annotation saliency 高于平均 non-annotation saliency，而是让 annotation source 和所有 causal source 竞争排名。
-
-***附录***：下面具体展开关于 floor 这个超参数的选定
-
-符号说明：
-
-* **\\theta\_{t-1}**：进入第 **t** 个 training step 前的模型参数
-* 第 **t** step 前向传播得到 sal 分布：
-
-**S\_t = S(\\theta\_{t-1}, \\mathcal{B}\_t)**	用这个 step 的 loss 做反传和更新，得到 **\\theta\_t**
-
-* **\\epsilon\_t**：第 **t** step 训练时实际用的 eps
-
-也就是说第 **t** step 可以这样：
-
-1. 用 **\\theta\_{t-1}** 前向，得到当前 batch 的 sal 分布：
-
-**S\_t=\\{c\_{q,r}(\\theta\_{t-1})\\}**
-
-2. 计算当前 batch quantile：
-
-**\\hat{\\epsilon}\_t = Q\_{0.75}(S\_t)**	这个0.75也是一个可以调整的超参数，目前看下来0.75最佳
-
-3. EMA 得到当前 step 实际使用的 eps：这样 eps 会平滑一些，loss 不至于抖动的太厉害；另外一开始不太稳定，所有不准备加 eps
-
-**\\epsilon\_t = \\begin{cases} 0, & t < T\_{warmup}\\\\ \\hat{\\epsilon}\_t, & t = T\_{warmup}\\\\ \\beta\\epsilon\_{t-1} + (1-\\beta)\\hat{\\epsilon}\_t, & t > T\_{warmup} \\end{cases}**
-
-4. 用这个 **\\epsilon\_t** 算当前 step 的 sal loss：
-
-**\\mathcal{L}^{(t)}\_{sal} = \\mathcal{L}\_{sal}(\\theta\_{t-1}; \\epsilon\_t)**
-
-5. 反传更新到 **\\theta\_t**
-
-经过实验结果验证可知，其他超参数最优为
-
-**Q=0.75,\\quad \\beta=0.95,\\quad T\_{warmup}=10**
 
 # 工作整理
 
@@ -1000,7 +897,7 @@ S = P\_{\\text{model}}(\\text{Correct} \\mid \\text{Input, Output})
 ```bash
 cd /mnt/nvme0n1/wenhao/Empirical-Influence-Function
 export PATH="$PWD/.local/bin:$PATH"
-eval "$($PWD/.local/bin/micromamba shell hook -s bash 2>/dev/null || micromamba shell hook -s bash)"
+eval "$("$PWD/.local/bin/micromamba" shell hook -s bash 2>/dev/null || micromamba shell hook -s bash)"
 export MAMBA_ROOT_PREFIX="$PWD/.micromamba"
 micromamba activate "$PWD/.micromamba/envs/eif-bench"
 ```
@@ -1046,7 +943,7 @@ GoSingle 是当前主要实验任务：从 Go 函数里挖出单行 statement，
 nohup bash -lc '
 cd /mnt/nvme0n1/wenhao/Empirical-Influence-Function
 export PATH="$PWD/.local/bin:$PATH"
-eval "$($PWD/.local/bin/micromamba shell hook -s bash 2>/dev/null || micromamba shell hook -s bash)"
+eval "$("$PWD/.local/bin/micromamba" shell hook -s bash 2>/dev/null || micromamba shell hook -s bash)"
 export MAMBA_ROOT_PREFIX="$PWD/.micromamba"
 micromamba activate "$PWD/.micromamba/envs/eif-bench"
 
@@ -1070,7 +967,7 @@ python scripts/go_single/build_go_single_data.py \
 nohup bash -lc '
 cd /mnt/nvme0n1/wenhao/Empirical-Influence-Function
 export PATH="$PWD/.local/bin:$PATH"
-eval "$($PWD/.local/bin/micromamba shell hook -s bash 2>/dev/null || micromamba shell hook -s bash)"
+eval "$("$PWD/.local/bin/micromamba" shell hook -s bash 2>/dev/null || micromamba shell hook -s bash)"
 export MAMBA_ROOT_PREFIX="$PWD/.micromamba"
 micromamba activate "$PWD/.micromamba/envs/eif-bench"
 
@@ -1103,7 +1000,7 @@ python scripts/go_single/oracle_eval_go_single.py \
 nohup bash -lc '
 cd /mnt/nvme0n1/wenhao/Empirical-Influence-Function
 export PATH="$PWD/.local/bin:$PATH"
-eval "$($PWD/.local/bin/micromamba shell hook -s bash 2>/dev/null || micromamba shell hook -s bash)"
+eval "$("$PWD/.local/bin/micromamba" shell hook -s bash 2>/dev/null || micromamba shell hook -s bash)"
 export MAMBA_ROOT_PREFIX="$PWD/.micromamba"
 micromamba activate "$PWD/.micromamba/envs/eif-bench"
 
@@ -1146,7 +1043,7 @@ python tools/visual_annotation/build_dynamic_annotation_viewer.py \
 | ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `src/train/train.py`                | 训练主入口。支持`ce_only`、`ce_saliency`、`saliency_only`。训练结束会保存模型和 `saliency_training_config.json`。                         |
 | `src/train/dataset.py`              | 读取 GoSingle compact 数据，把`attention_edges` 转为训练用 `annot_pairs`。                                                                |
-| `src/train/loss.py`                 | Saliency 与 loss 实现。`softmax` 是 raw saliency softmax loss；`softmax_margin` 是 log-saliency + negative floor 的 softmax-margin loss。 |
+| `src/train/loss.py`                 | Saliency 与 loss 实现。`contrastive` (pairwise triplet hinge，**当前推荐**) / `softmax_margin` (InfoNCE + negative floor) / `ranknet` / `margin_bce` / `softmax`。 |
 | `src/train/saliency_diagnostics.py` | 训练时详细 saliency 诊断，统计 recall@k、precision@k、mAP@k 和 query/edge 级数据。                                                        |
 
 CE baseline：
@@ -1155,7 +1052,7 @@ CE baseline：
 nohup bash -lc '
 cd /mnt/nvme0n1/wenhao/Empirical-Influence-Function
 export PATH="$PWD/.local/bin:$PATH"
-eval "$($PWD/.local/bin/micromamba shell hook -s bash 2>/dev/null || micromamba shell hook -s bash)"
+eval "$("$PWD/.local/bin/micromamba" shell hook -s bash 2>/dev/null || micromamba shell hook -s bash)"
 export MAMBA_ROOT_PREFIX="$PWD/.micromamba"
 micromamba activate "$PWD/.micromamba/envs/eif-bench"
 
@@ -1177,13 +1074,100 @@ python src/train/train.py \
 ' > runs/go_single/train_ce_loss_500_run1.log 2>&1 &
 ```
 
-CE + saliency。当前默认推荐使用 `softmax_margin`：
+CE + saliency。当前**推荐两套配置**：
+
+- **🏆 推荐 1：Pairwise Contrastive (triplet hinge) — `τ=1.0, m=2, λ=3`**  
+  500 样本训练 100 步训练集 mAP=0.826 / R@10=0.952 / P@1=0.812，是目前最优配置。  
+  详细分析见 [outputs/docs/saliency_loss_report_v2.md](outputs/docs/saliency_loss_report_v2.md)。
+
+  ```bash
+  nohup bash -lc '
+  cd /mnt/nvme0n1/wenhao/Empirical-Influence-Function
+  export PATH="$PWD/.local/bin:$PATH"
+  eval "$("$PWD/.local/bin/micromamba" shell hook -s bash 2>/dev/null || micromamba shell hook -s bash)"
+  export MAMBA_ROOT_PREFIX="$PWD/.micromamba"
+  micromamba activate "$PWD/.micromamba/envs/eif-bench"
+
+  CUDA_VISIBLE_DEVICES=3 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  python src/train/train.py \
+    --model_name_or_path models/Qwen2.5-Coder-7B-Instruct \
+    --data_path data/go_single/train_data/go_single_train_v2_graphsignal_500_compact.json \
+    --output_dir outputs/go_single/models/ce_contrastive_tau1p0_m2p0_lam3p0 \
+    --use_peft True \
+    --lora_r 16 --lora_alpha 32 --lora_dropout 0.05 \
+    --loss_mode ce_saliency \
+    --saliency_loss_type contrastive \
+    --saliency_alpha 1.0 \
+    --saliency_margin_plus 2.0 \
+    --saliency_lambda 3.0 \
+    --saliency_eps 1e-8 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 8 \
+    --max_steps 100 \
+    --learning_rate 2e-4 \
+    --logging_steps 1 \
+    --save_strategy no \
+    --report_to none
+  ' > runs/go_single/train_ce_contrastive_tau1p0_m2p0_lam3p0.log 2>&1 &
+  ```
+
+  关键参数说明：
+  - `--saliency_loss_type contrastive`：pairwise triplet hinge loss，每个 (positive, negative) 对独立施加 hinge，**无 softmax 归一化 → 不存在 winner-takes-all**。
+  - `--saliency_alpha 1.0`：temperature τ。τ=1.0 配合大 margin 实测最优。
+  - `--saliency_margin_plus 2.0`：hinge margin m。要求 `log C_pos ≥ log C_neg + m·τ`，超过即梯度归零。
+  - `--saliency_lambda 3.0`：⚠️ **必须显著调大**。contrastive 的 pair-mean loss 数值远小于 InfoNCE NLL，λ=0.1 会被 CE 完全压制。
+
+- **推荐 2：InfoNCE + 固定 logit floor — `τ=0.1, floor_logit=-10, λ=0.1`**  
+  传统 InfoNCE 路线下的最优配置，500 样本训练集 mAP=0.771 / R@10=0.905。如果偏好 softmax-NLL 形式可用此设置；性能略低于 contrastive。
+
+  ```bash
+  nohup bash -lc '
+  cd /mnt/nvme0n1/wenhao/Empirical-Influence-Function
+  export PATH="$PWD/.local/bin:$PATH"
+  eval "$("$PWD/.local/bin/micromamba" shell hook -s bash 2>/dev/null || micromamba shell hook -s bash)"
+  export MAMBA_ROOT_PREFIX="$PWD/.micromamba"
+  micromamba activate "$PWD/.micromamba/envs/eif-bench"
+
+  CUDA_VISIBLE_DEVICES=3 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  python src/train/train.py \
+    --model_name_or_path models/Qwen2.5-Coder-7B-Instruct \
+    --data_path data/go_single/train_data/go_single_train_v2_graphsignal_500_compact.json \
+    --output_dir outputs/go_single/models/ce_sal_softmax_margin_logit_eps_m10_tau0p1_500_run1 \
+    --use_peft True \
+    --lora_r 16 --lora_alpha 32 --lora_dropout 0.05 \
+    --loss_mode ce_saliency \
+    --saliency_loss_type softmax_margin \
+    --saliency_lambda 0.1 \
+    --saliency_alpha 0.1 \
+    --saliency_eps 1e-8 \
+    --saliency_floor_eps_mode fixed \
+    --saliency_floor_logit_eps -10 \
+    --saliency_floor_warmup_steps 0 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 8 \
+    --max_steps 100 \
+    --learning_rate 2e-4 \
+    --logging_steps 1 \
+    --save_strategy no \
+    --report_to none
+  ' > runs/go_single/train_ce_sal_softmax_margin_logit_eps_m10_tau0p1_500_run1.log 2>&1 &
+  ```
+
+  关键参数说明：
+  - `--saliency_loss_type softmax_margin`：InfoNCE-style multi-positive NLL，negative 一侧带 floor。
+  - `--saliency_alpha 0.1`：temperature τ=0.1，让 softmax 在 ranking 上更尖锐。
+  - `--saliency_floor_eps_mode fixed --saliency_floor_logit_eps -10`：**固定 logit-space floor**，永不漂移。`log(C+eps)/τ` 在 `≤ -10` 时被 clamp（约 `C ≤ e^{-10·0.1}=e^{-1}≈0.37` 才算"被压"）。
+  - `--saliency_floor_warmup_steps 0`：无 warmup，从第 1 步就生效。
+
+> ⚠️ **`--saliency_floor_eps_mode ema_quantile` 已废弃**：实测确认存在 4 个独立 bug（76% negative 被 clamp 无梯度 / floor 跟 Q75 漂移导致"水涨船高" / σ 饱和 / 1/(τC) 衰减），训练后 sal_loss 卡在 ~3.1 不下降。详细数据见 [outputs/docs/saliency_loss_report_v2.md §1](outputs/docs/saliency_loss_report_v2.md)。新实验请勿使用 `ema_quantile` 模式。
+
+下面的 ema_quantile 配置仅作历史复现保留：
 
 ```bash
 nohup bash -lc '
 cd /mnt/nvme0n1/wenhao/Empirical-Influence-Function
 export PATH="$PWD/.local/bin:$PATH"
-eval "$($PWD/.local/bin/micromamba shell hook -s bash 2>/dev/null || micromamba shell hook -s bash)"
+eval "$("$PWD/.local/bin/micromamba" shell hook -s bash 2>/dev/null || micromamba shell hook -s bash)"
 export MAMBA_ROOT_PREFIX="$PWD/.micromamba"
 micromamba activate "$PWD/.micromamba/envs/eif-bench"
 
@@ -1215,48 +1199,13 @@ python src/train/train.py \
 ' > runs/go_single/train_ce_sal_softmax_margin_500_run1.log 2>&1 &
 ```
 
-固定 logit floor `eps=-10`、temperature `tau=0.1` 的 CE + saliency：
-
-```bash
-nohup bash -lc '
-cd /mnt/nvme0n1/wenhao/Empirical-Influence-Function
-export PATH="$PWD/.local/bin:$PATH"
-eval "$($PWD/.local/bin/micromamba shell hook -s bash 2>/dev/null || micromamba shell hook -s bash)"
-export MAMBA_ROOT_PREFIX="$PWD/.micromamba"
-micromamba activate "$PWD/.micromamba/envs/eif-bench"
-
-CUDA_VISIBLE_DEVICES=3 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-python src/train/train.py \
-  --model_name_or_path models/Qwen2.5-Coder-7B-Instruct \
-  --data_path data/go_single/train_data/go_single_train_v2_graphsignal_500_compact.json \
-  --output_dir outputs/go_single/models/ce_sal_softmax_margin_logit_eps_m10_tau0p1_500_run1 \
-  --use_peft True \
-  --lora_r 16 --lora_alpha 32 --lora_dropout 0.05 \
-  --loss_mode ce_saliency \
-  --saliency_loss_type softmax_margin \
-  --saliency_lambda 0.1 \
-  --saliency_alpha 0.1 \
-  --saliency_eps 1e-8 \
-  --saliency_floor_eps_mode fixed \
-  --saliency_floor_logit_eps -10 \
-  --saliency_floor_warmup_steps 0 \
-  --per_device_train_batch_size 1 \
-  --gradient_accumulation_steps 8 \
-  --max_steps 100 \
-  --learning_rate 2e-4 \
-  --logging_steps 1 \
-  --save_strategy no \
-  --report_to none
-' > runs/go_single/train_ce_sal_softmax_margin_logit_eps_m10_tau0p1_500_run1.log 2>&1 &
-```
-
 只训练 saliency loss：
 
 ```bash
 nohup bash -lc '
 cd /mnt/nvme0n1/wenhao/Empirical-Influence-Function
 export PATH="$PWD/.local/bin:$PATH"
-eval "$($PWD/.local/bin/micromamba shell hook -s bash 2>/dev/null || micromamba shell hook -s bash)"
+eval "$("$PWD/.local/bin/micromamba" shell hook -s bash 2>/dev/null || micromamba shell hook -s bash)"
 export MAMBA_ROOT_PREFIX="$PWD/.micromamba"
 micromamba activate "$PWD/.micromamba/envs/eif-bench"
 
@@ -1299,7 +1248,7 @@ python src/train/train.py \
 nohup bash -lc '
 cd /mnt/nvme0n1/wenhao/Empirical-Influence-Function
 export PATH="$PWD/.local/bin:$PATH"
-eval "$($PWD/.local/bin/micromamba shell hook -s bash 2>/dev/null || micromamba shell hook -s bash)"
+eval "$("$PWD/.local/bin/micromamba" shell hook -s bash 2>/dev/null || micromamba shell hook -s bash)"
 export MAMBA_ROOT_PREFIX="$PWD/.micromamba"
 micromamba activate "$PWD/.micromamba/envs/eif-bench"
 
@@ -1337,7 +1286,7 @@ python tools/visual_saliency/build_base_vs_ours_annotation_viewer.py \
 nohup bash -lc '
 cd /mnt/nvme0n1/wenhao/Empirical-Influence-Function
 export PATH="$PWD/.local/bin:$PATH"
-eval "$($PWD/.local/bin/micromamba shell hook -s bash 2>/dev/null || micromamba shell hook -s bash)"
+eval "$("$PWD/.local/bin/micromamba" shell hook -s bash 2>/dev/null || micromamba shell hook -s bash)"
 export MAMBA_ROOT_PREFIX="$PWD/.micromamba"
 micromamba activate "$PWD/.micromamba/envs/eif-bench"
 
@@ -1398,7 +1347,7 @@ python scripts/saliency_exp/render_row_token_trace_report.py \
 nohup bash -lc '
 cd /mnt/nvme0n1/wenhao/Empirical-Influence-Function
 export PATH="$PWD/.local/bin:$PATH"
-eval "$($PWD/.local/bin/micromamba shell hook -s bash 2>/dev/null || micromamba shell hook -s bash)"
+eval "$("$PWD/.local/bin/micromamba" shell hook -s bash 2>/dev/null || micromamba shell hook -s bash)"
 export MAMBA_ROOT_PREFIX="$PWD/.micromamba"
 micromamba activate "$PWD/.micromamba/envs/eif-bench"
 
@@ -1468,3 +1417,33 @@ python scripts/go_single/evaluate_go_single_predictions.py \
   --pass-k 10 \
   --compute-codebleu
 ```
+
+
+我正在进行一个名为“Qwen 代码语言模型训练”的项目，项目信息如下
+
+Train (模型训练与识别错题) → Attribution (双线归因：找错因与找错题来源) → Curation (数据治理与损失干预) 这三步走战略
+
+1. 数据准备与模型训练：Qwen 大模型训练，模型任务是 Go 语言代码补全，由于产生了一些不明所以的错误输出，由此引出对训练数据 Attribution 和 Curation 的探索
+2. 双线归因与可视化分析 Data Attribution
+   1. 数据归因 Samples Attribution: 哪些 harmful 样本导致了模型学习了错误的 correlation
+   2. 特征归因 Token Attribution: 某一次预测或者推理中，哪些 token 导致了模型产生了错误的输出
+3. 数据治理 Data Curation：敲除或者降权不良样本，重新微调模型
+
+# 文件结构及其作用
+
+本节只说明根目录下的主要目录和文件职责，便于快速判断代码、数据、结果和日志分别放在哪里。
+
+
+| 路径               | 作用                                                                                                              |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------- |
+| `src/`             | 项目核心代码。包含模型训练、GraphSignal 标注、attribution 归因、SFT 数据处理等主要实现。                          |
+| `scripts/`         | 面向实验流程的脚本入口。主要负责 benchmark 数据构建、治理算子调度、评测、结果合并，以及若干可直接运行的实验脚本。 |
+| `data/`            | 数据目录。保存原始数据、benchmark 统一格式数据、SFT 训练数据、评测数据，以及治理后可直接训练的数据。              |
+| `outputs/`         | 实验输出目录。保存训练得到的模型/LoRA adapter、评测结果、可视化页面、文档说明和中间产物。                         |
+| `runs/`            | 运行日志目录。长任务的训练日志、标注日志、评测日志和数据处理日志通常放在这里，便于复盘和断点排查。                |
+| `tools/`           | 辅助工具目录。当前主要包含标注结果可视化等面向人工检查的工具。                                                    |
+| `AGENTS.md`        | 面向协作者或代码代理的项目说明，包含项目目标、工作流、目录约定和协作注意事项。                                    |
+| `README.md`        | 项目总览文档，说明项目目标、整体流程和根目录结构。                                                                |
+| `requirements.txt` | Python 依赖列表，用于配置项目运行环境。                                                                           |
+
+隐藏目录如 `.git/`、`.vscode/`、`.venv/`、`.micromamba/`、`.local/` 主要服务于版本管理、IDE 配置或本地环境，不属于项目算法流程本身。

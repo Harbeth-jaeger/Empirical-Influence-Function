@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 
 import torch
@@ -8,6 +9,12 @@ import torch.nn.functional as F
 from torch import Tensor
 
 logger = logging.getLogger(__name__)
+
+def _unwrap_module(m):
+    while hasattr(m, "module"):
+        m = m.module
+    return m
+
 
 
 def _unwrap_to_decoder_stack(model):
@@ -40,13 +47,14 @@ def build_contribution_matrix(
         Strict Kobayashi/ALTI contribution c_{i,j} = ||T_i(x_j)||_2 for the last layer.
     """
     decoder = _unwrap_to_decoder_stack(model)
-    layer = decoder.layers[-1] # last decoder block
+    layer = _unwrap_module(decoder.layers[-1]) # last decoder block
     self_attn = layer.self_attn
 
     B, T, D = last_hidden_in.shape
     H = attn_probs.size(1)
     device = last_hidden_in.device
     dtype = last_hidden_in.dtype
+    compute_dtype = dtype if dtype in (torch.float16, torch.bfloat16) else torch.float32
 
     head_dim = getattr(self_attn, "head_dim", None) or (
         self_attn.q_proj.weight.shape[0] // H
@@ -124,12 +132,26 @@ def canonical_saliency_loss_type(loss_type: str | None) -> str:
         return "softmax_margin"
     if value in {"softmax", "softmax_loss"}:
         return "softmax"
-    raise ValueError(f"Unsupported saliency loss_type={loss_type!r}; expected softmax_margin or softmax.")
+    if value in {"margin_bce", "bce_margin", "decoupled_bce", "per_edge_bce"}:
+        return "margin_bce"
+    if value in {"ranknet", "pairwise", "pairwise_ranknet", "rank_net"}:
+        return "ranknet"
+    if value in {"contrastive", "triplet", "pair_hinge", "pairwise_hinge"}:
+        return "contrastive"
+    raise ValueError(f"Unsupported saliency loss_type={loss_type!r}; expected softmax_margin, softmax, margin_bce, ranknet, or contrastive.")
 
 
 def saliency_loss_display_name(loss_type: str | None) -> str:
     kind = canonical_saliency_loss_type(loss_type)
-    return "softmax loss" if kind == "softmax" else "softmax-margin loss"
+    if kind == "softmax":
+        return "softmax loss"
+    if kind == "margin_bce":
+        return "decoupled margin-BCE loss"
+    if kind == "ranknet":
+        return "pairwise RankNet loss"
+    if kind == "contrastive":
+        return "pairwise contrastive (triplet hinge) loss"
+    return "softmax-margin loss"
 
 
 def flatten_annot_pairs(
@@ -393,13 +415,14 @@ def build_contribution_rows(
     InfoNCE saliency loss.
     """
     decoder = _unwrap_to_decoder_stack(model)
-    layer = decoder.layers[-1]
+    layer = _unwrap_module(decoder.layers[-1])
     self_attn = layer.self_attn
 
     B, T, D = last_hidden_in.shape
     H = attn_probs.size(1)
     device = last_hidden_in.device
     dtype = last_hidden_in.dtype
+    compute_dtype = dtype if dtype in (torch.float16, torch.bfloat16) else torch.float32
 
     head_dim = getattr(self_attn, "head_dim", None) or (
         self_attn.q_proj.weight.shape[0] // H
@@ -409,13 +432,13 @@ def build_contribution_rows(
     assert H % num_kv_heads == 0, f"H={H} not divisible by num_kv_heads={num_kv_heads}"
     n_rep = H // num_kv_heads
 
-    gamma = layer.input_layernorm.weight.to(device).float()
-    gamma_x = last_hidden_in.float() * gamma
-    v_w = self_attn.v_proj.weight.to(device).float()
+    gamma = layer.input_layernorm.weight.to(device=device, dtype=compute_dtype)
+    gamma_x = last_hidden_in.to(compute_dtype) * gamma
+    v_w = self_attn.v_proj.weight.to(device=device, dtype=compute_dtype)
     v_b = self_attn.v_proj.bias
     v_proj = gamma_x @ v_w.t()
     if v_b is not None:
-        v_proj = v_proj + v_b.to(device).float()
+        v_proj = v_proj + v_b.to(device=device, dtype=compute_dtype)
     v_states = v_proj.view(B, T, num_kv_heads, head_dim).permute(0, 2, 1, 3)
     if n_rep > 1:
         v_states = (
@@ -424,9 +447,8 @@ def build_contribution_rows(
             .reshape(B, H, T, head_dim)
         )
 
-    o_w = self_attn.o_proj.weight.to(device).float()
+    o_w = self_attn.o_proj.weight.to(device=device, dtype=compute_dtype)
     o_w_by_head = o_w.view(D, H, head_dim)
-    transformed = torch.einsum("bhsd,ohd->bhso", v_states, o_w_by_head)
 
     row_batch = row_batch.to(device=device, dtype=torch.long)
     row_qry = row_qry.to(device=device, dtype=torch.long)
@@ -435,24 +457,35 @@ def build_contribution_rows(
         return torch.empty((0, T), device=device, dtype=dtype)
 
     eps_rms = getattr(layer.input_layernorm, "variance_epsilon", 1e-6)
-    query_hidden = last_hidden_in.float()[row_batch, row_qry, :]       # [Q, D]
-    sigma_q = query_hidden.pow(2).mean(dim=-1).add(eps_rms).sqrt().clamp_min(1e-12)
+    query_hidden_f = last_hidden_in.float()[row_batch, row_qry, :]     # [Q, D]
+    query_hidden = last_hidden_in.to(compute_dtype)[row_batch, row_qry, :]
+    sigma_q = query_hidden_f.pow(2).mean(dim=-1).add(eps_rms).sqrt().clamp_min(1e-12)
 
-    attn_f = attn_probs.float()
+    attn_f = attn_probs.to(compute_dtype)
     chunks = []
     for start in range(0, T, source_chunk_size):
         stop = min(start + source_chunk_size, T)
         attn_chunk = attn_f[row_batch, :, row_qry, start:stop]         # [Q, H, S]
-        transformed_chunk = transformed[row_batch, :, start:stop, :]   # [Q, H, S, D]
-        contrib = torch.einsum("qhs,qhso->qso", attn_chunk, transformed_chunk)
+        S = stop - start
+        contrib = torch.zeros((Q, S, D), device=device, dtype=compute_dtype)
+        # Keep the [Q, H, S, D] transformed value projection from becoming
+        # the peak allocation on dense annotation batches.
+        head_chunk_size = 1
+        for h_start in range(0, H, head_chunk_size):
+            h_stop = min(h_start + head_chunk_size, H)
+            attn_part = attn_chunk[:, h_start:h_stop, :]               # [Q, h, S]
+            v_part = v_states[row_batch, h_start:h_stop, start:stop, :] # [Q, h, S, head_dim]
+            o_part = o_w_by_head[:, h_start:h_stop, :]                 # [D, h, head_dim]
+            transformed_part = torch.einsum("qhsd,ohd->qhso", v_part, o_part)
+            contrib = contrib + torch.einsum("qhs,qhso->qso", attn_part, transformed_part)
 
         diag_mask = (row_qry >= start) & (row_qry < stop)
         if bool(diag_mask.any()):
             local = row_qry[diag_mask] - start
             contrib[diag_mask, local, :] = contrib[diag_mask, local, :] + query_hidden[diag_mask]
 
-        contrib = contrib / sigma_q.view(Q, 1, 1)
-        chunks.append(contrib.norm(dim=-1, p=2).to(dtype))
+        contrib = contrib / sigma_q.to(compute_dtype).view(Q, 1, 1)
+        chunks.append(contrib.float().norm(dim=-1, p=2).to(dtype))
 
     return torch.cat(chunks, dim=1)
 
@@ -602,6 +635,12 @@ def compute_saliency_loss_from_rows(
     floor_eps_warmup_steps: int = 0,
     floor_logit_eps: float | None = None,
     loss_type: str = "softmax_margin",
+    margin_plus: float = 2.08,    # log(8) — desired log-saliency lower bound for annotated edges
+    margin_minus: float = 0.41,   # log(1.5) — log-saliency upper bound for non-annot edges (no penalty below)
+    margin_gamma: float = 2.0,    # softplus sharpness
+    neg_weight: float = 0.5,      # multiplier on the negative-side mean penalty
+    neg_hard_only: bool = False,  # if True, average only over negatives with r > margin_minus
+    neg_sample_k: int = 0,        # if >0, randomly subsample this many negatives per query for softmax/softmax_margin (MoCo-style)
 ) -> SaliencyDiagnostics:
     """Saliency objective with C already row-gathered."""
     Q, T = C_rows.shape
@@ -653,6 +692,34 @@ def compute_saliency_loss_from_rows(
     nonannot_I = non_annot_mask[I_mask]
 
     loss_kind = canonical_saliency_loss_type(loss_type)
+
+    # Optional MoCo-style negative subsampling for softmax / softmax_margin.
+    # For each query, keep at most `neg_sample_k` randomly-chosen negatives
+    # active inside the saliency loss. Positives and the non-causal mask
+    # are untouched. Sampling weights are uniform over current negatives so
+    # every above-floor negative has an equal expected gradient share, breaking
+    # the InfoNCE winner-takes-all bias. Across steps the iid resampling covers
+    # the full N_q (MoCo / SimCLR style).
+    if (
+        int(neg_sample_k) > 0
+        and loss_kind in ("softmax", "softmax_margin", "ranknet", "contrastive")
+        and nonannot_I.size(0) > 0
+    ):
+        k = int(neg_sample_k)
+        with torch.no_grad():
+            neg_counts = nonannot_I.sum(dim=-1)
+            # rows where we actually need to subsample (>k negatives)
+            sample_rows = (neg_counts > k).nonzero(as_tuple=True)[0]
+            if sample_rows.numel() > 0:
+                # build per-row uniform weights on the negative positions
+                weights = nonannot_I[sample_rows].to(torch.float32) + 1e-12  # [R, T]
+                # zero-weight non-causal/positive positions stay near-zero; we want exactly 0
+                weights = weights * nonannot_I[sample_rows].to(torch.float32)
+                idx = torch.multinomial(weights, num_samples=k, replacement=False)  # [R, k]
+                new_mask = torch.zeros_like(nonannot_I[sample_rows])
+                new_mask.scatter_(1, idx, 1.0)
+                nonannot_I = nonannot_I.clone()
+                nonannot_I[sample_rows] = new_mask
 
     floor_mode = (floor_eps_mode or "fixed").strip().lower()
     batch_floor_eps = None
@@ -718,8 +785,103 @@ def compute_saliency_loss_from_rows(
         loss = (pos_nll.sum(dim=-1) / n_pos).mean().to(dtype)
         if floor_logit_eps is None:
             diag_floor_mode = floor_mode
+    elif loss_kind == "margin_bce":
+        # Per-edge decoupled soft-margin BCE on log-saliency.
+        # r_{q,s} = log(C+eps); positives pushed above margin_plus, negatives
+        # pushed below margin_minus. Both penalties use softplus(gamma * delta)/gamma
+        # so per-edge gradient is sigmoid-bounded in (0, 1) and saturates smoothly
+        # once the edge is on the right side of its margin. No shared denominator,
+        # so positives don't compete, and margins are absolute constants (set from
+        # the base model once) so they cannot drift with training.
+        r = torch.log(C_rows_I.float() + eps_f)              # [Qi, T]
+        gamma = max(float(margin_gamma), eps_f)
+        # Positive side:
+        pos_arg = gamma * (float(margin_plus) - r)
+        pos_term = F.softplus(pos_arg) / gamma               # [Qi, T]
+        pos_term = pos_term * annot_I                        # mask to positives
+        n_pos = annot_I.sum(dim=-1).clamp_min(eps)
+        pos_loss_q = pos_term.sum(dim=-1) / n_pos            # [Qi]
+        # Negative side:
+        neg_arg = gamma * (r - float(margin_minus))
+        neg_term = F.softplus(neg_arg) / gamma               # [Qi, T]
+        if neg_hard_only:
+            active = nonannot_I * (r > float(margin_minus)).to(nonannot_I.dtype)
+            neg_term = neg_term * active
+            n_neg = active.sum(dim=-1).clamp_min(eps)
+        else:
+            neg_term = neg_term * nonannot_I
+            n_neg = nonannot_I.sum(dim=-1).clamp_min(eps)
+        neg_loss_q = neg_term.sum(dim=-1) / n_neg            # [Qi]
+
+        loss = (pos_loss_q + float(neg_weight) * neg_loss_q).mean().to(dtype)
+        diag_floor_mode = "margin_bce"
+        floor_eps_kind = "absolute_margin"
+        # surface margins in the existing diag fields for log readability
+        effective_floor_eps = float(math.exp(float(margin_minus)) - eps_f)
+        effective_floor_logit = float(margin_minus)
+    elif loss_kind == "ranknet":
+        # Pairwise RankNet on log-saliency. For each query q and each
+        # (positive s, negative s') pair:
+        #   loss_{q,s,s'} = softplus( (log C_{q,s'} - log C_{q,s}) / tau )
+        # Each pair contributes an independent sigmoid-bounded gradient — no
+        # shared softmax denominator, so no winner-takes-all on either side.
+        # Softplus saturates as the negative falls below the positive, which
+        # acts as a natural "robust floor" without any explicit threshold.
+        tau = max(float(alpha), eps_f)
+        scores = torch.log(C_rows_I.float() + eps_f)         # [Qi, T]
+        Qi = scores.shape[0]
+        per_q_losses = []
+        for q in range(Qi):
+            p_idx = annot_I[q].bool().nonzero(as_tuple=True)[0]
+            n_idx = nonannot_I[q].bool().nonzero(as_tuple=True)[0]
+            if p_idx.numel() == 0 or n_idx.numel() == 0:
+                continue
+            pos = scores[q, p_idx]                            # [|A|]
+            neg = scores[q, n_idx]                            # [|N|]
+            diff = (neg.unsqueeze(0) - pos.unsqueeze(1)) / tau  # [|A|, |N|]
+            per_q_losses.append(F.softplus(diff).mean())
+        if per_q_losses:
+            loss = torch.stack(per_q_losses).mean().to(dtype)
+        else:
+            loss = torch.zeros((), device=device, dtype=dtype)
+        diag_floor_mode = "ranknet"
+        floor_eps_kind = "pairwise"
+        effective_floor_eps = 0.0
+        effective_floor_logit = 0.0
+    elif loss_kind == "contrastive":
+        # Classic triplet-style pair hinge on log-saliency. For each query q and
+        # each (positive s, negative s') pair:
+        #   loss_{q,s,s'} = max(0, margin + (log C_{q,s'} - log C_{q,s}) / tau)
+        # Margin is set in log-saliency units via `margin_plus`. Once a pair is
+        # on the right side of the margin, its gradient is exactly zero — so
+        # already-correct negatives stop being pushed down and already-strong
+        # positives stop being pulled up. This gives a sparse, robust signal
+        # and avoids both InfoNCE's winner-takes-all and RankNet's softplus
+        # tail still leaking gradient to easy pairs.
+        tau = max(float(alpha), eps_f)
+        margin = float(margin_plus)
+        scores = torch.log(C_rows_I.float() + eps_f)         # [Qi, T]
+        Qi_ = scores.shape[0]
+        per_q = []
+        for q in range(Qi_):
+            p_idx = annot_I[q].bool().nonzero(as_tuple=True)[0]
+            n_idx = nonannot_I[q].bool().nonzero(as_tuple=True)[0]
+            if p_idx.numel() == 0 or n_idx.numel() == 0:
+                continue
+            pos = scores[q, p_idx]
+            neg = scores[q, n_idx]
+            diff = (neg.unsqueeze(0) - pos.unsqueeze(1)) / tau  # [|A|, |N|]
+            per_q.append(F.relu(margin + diff).mean())
+        if per_q:
+            loss = torch.stack(per_q).mean().to(dtype)
+        else:
+            loss = torch.zeros((), device=device, dtype=dtype)
+        diag_floor_mode = "contrastive"
+        floor_eps_kind = "pair_hinge"
+        effective_floor_eps = 0.0
+        effective_floor_logit = float(margin)
     else:
-        raise ValueError(f"Unsupported saliency loss_type={loss_type!r}; expected softmax_margin or softmax.")
+        raise ValueError(f"Unsupported saliency loss_type={loss_type!r}; expected softmax_margin, softmax, margin_bce, ranknet, or contrastive.")
 
     C_bar_I = C_bar[I_mask]
     N_bar_I = N_bar[I_mask]
@@ -761,6 +923,13 @@ def saliency_loss_from_outputs(
         floor_eps_warmup_steps: int = 0,
         floor_logit_eps: float | None = None,
         loss_type: str = "softmax_margin",
+        margin_plus: float = 2.08,
+        margin_minus: float = 0.41,
+        margin_gamma: float = 2.0,
+        neg_weight: float = 0.5,
+        neg_hard_only: bool = False,
+        neg_sample_k: int = 0,
+        source_chunk_size: int = 16,
 ) -> SaliencyDiagnostics:
     """
     Takes the model's forward output and produces the saliency diagnostics in one call.
@@ -775,6 +944,14 @@ def saliency_loss_from_outputs(
     # hidden_states tuple: [embedding_out, layer_1_out, ..., layer_L_out]
     # input to the last decoder layer = hidden_states[-2]
     last_hidden_in = outputs.hidden_states[-2]  # [B, T, D]
+    # The saliency objective only needs the last-layer attention and the input
+    # to the final decoder block. Keeping every layer hidden/attention alive
+    # can add several GiB of peak memory before contribution rows are built.
+    try:
+        outputs.attentions = (attn_last,)
+        outputs.hidden_states = (last_hidden_in,)
+    except Exception:
+        pass
 
     B, T, _ = last_hidden_in.shape
     row_batch, row_qry, src_all, inv = _annotation_rows_from_pairs(
@@ -799,6 +976,7 @@ def saliency_loss_from_outputs(
         attn_last,
         row_batch,
         row_qry,
+        source_chunk_size=max(1, int(source_chunk_size)),
     )
     return compute_saliency_loss_from_rows(
         C_rows,
@@ -818,4 +996,10 @@ def saliency_loss_from_outputs(
         floor_eps_warmup_steps=floor_eps_warmup_steps,
         floor_logit_eps=floor_logit_eps,
         loss_type=loss_type,
+        margin_plus=margin_plus,
+        margin_minus=margin_minus,
+        margin_gamma=margin_gamma,
+        neg_weight=neg_weight,
+        neg_hard_only=neg_hard_only,
+        neg_sample_k=neg_sample_k,
     )

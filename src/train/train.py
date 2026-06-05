@@ -24,6 +24,16 @@ from loss import canonical_saliency_loss_type, saliency_loss_display_name, salie
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+# Compatibility shim for older torch builds used with newer Transformers FSDP code.
+try:
+    import torch.distributed.fsdp as _fsdp
+    if not hasattr(_fsdp, "register_fsdp_forward_method"):
+        def _register_fsdp_forward_method(model, method_name):
+            return None
+        _fsdp.register_fsdp_forward_method = _register_fsdp_forward_method
+except Exception:
+    pass
+
 
 
 # ── Custom Trainer ────────────────────────────────────────────────────────────
@@ -49,6 +59,13 @@ class AnnotatedSFTTrainer(Trainer):
                  saliency_detail_log_path: str = "",
                  saliency_detail_log_steps: int = 0,
                  saliency_detail_top_k: int = 10,
+                 saliency_margin_plus: float = 2.08,
+                 saliency_margin_minus: float = 0.41,
+                 saliency_margin_gamma: float = 2.0,
+                 saliency_neg_weight: float = 0.5,
+                 saliency_neg_hard_only: bool = False,
+                 saliency_neg_sample_k: int = 0,
+                 saliency_source_chunk_size: int = 16,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.saliency_lambda = saliency_lambda
@@ -68,6 +85,13 @@ class AnnotatedSFTTrainer(Trainer):
         self.saliency_detail_log_path = saliency_detail_log_path
         self.saliency_detail_log_steps = saliency_detail_log_steps
         self.saliency_detail_top_k = saliency_detail_top_k
+        self.saliency_margin_plus = saliency_margin_plus
+        self.saliency_margin_minus = saliency_margin_minus
+        self.saliency_margin_gamma = saliency_margin_gamma
+        self.saliency_neg_weight = saliency_neg_weight
+        self.saliency_neg_hard_only = saliency_neg_hard_only
+        self.saliency_neg_sample_k = int(saliency_neg_sample_k or 0)
+        self.saliency_source_chunk_size = max(1, int(saliency_source_chunk_size or 16))
         if self.saliency_detail_log_path and self.is_world_process_zero():
             os.makedirs(os.path.dirname(self.saliency_detail_log_path), exist_ok=True)
 
@@ -91,16 +115,23 @@ class AnnotatedSFTTrainer(Trainer):
         if self.loss_mode != "saliency_only":
             forward_kwargs["labels"] = inputs["labels"]
         outputs = model(**forward_kwargs)
+        loss_device = outputs.logits.device
+        loss_dtype = outputs.logits.dtype
 
         if self.loss_mode == "saliency_only":
-            ntp_loss = torch.zeros((), device=outputs.logits.device, dtype=outputs.logits.dtype)
+            ntp_loss = torch.zeros((), device=loss_device, dtype=loss_dtype)
         else:
             ntp_loss = outputs.loss
             if ntp_loss.dim() > 0:
                 ntp_loss = ntp_loss.mean()
 
+        try:
+            outputs.logits = None
+        except Exception:
+            pass
+
         diag = None
-        saliency_loss = torch.zeros((), device=outputs.logits.device, dtype=outputs.logits.dtype)
+        saliency_loss = torch.zeros((), device=loss_device, dtype=loss_dtype)
         if self.loss_mode != "ce_only":
             floor_step = self.saliency_floor_step + 1
             diag = saliency_loss_from_outputs(
@@ -119,6 +150,13 @@ class AnnotatedSFTTrainer(Trainer):
                 floor_eps_warmup_steps=self.saliency_floor_warmup_steps,
                 floor_logit_eps=self.saliency_floor_logit_eps,
                 loss_type=self.saliency_loss_type,
+                margin_plus=self.saliency_margin_plus,
+                margin_minus=self.saliency_margin_minus,
+                margin_gamma=self.saliency_margin_gamma,
+                neg_weight=self.saliency_neg_weight,
+                neg_hard_only=self.saliency_neg_hard_only,
+                neg_sample_k=self.saliency_neg_sample_k,
+                source_chunk_size=self.saliency_source_chunk_size,
             )
             saliency_loss = diag.loss
             self.saliency_floor_step = floor_step
@@ -228,17 +266,8 @@ class AnnotatedSFTTrainer(Trainer):
                     "saliency_eps_floor_effective": diag.floor_eps if diag is not None else self.saliency_floor_eps,
                     "saliency_eps_floor_batch": diag.batch_floor_eps if diag is not None else 0.0,
                     "saliency_eps_floor_logit": diag.floor_logit_eps if diag is not None else 0.0,
-                    "saliency/Cbar": diag.avg_C if diag is not None else 0.0,
-                    "saliency/Nbar": diag.avg_N if diag is not None else 0.0,
-                    "saliency/ratio": diag.avg_ratio if diag is not None else 0.0,
-                    "saliency/n_queries": diag.n_queries if diag is not None else 0,
-                    "saliency/floor_eps": diag.floor_eps if diag is not None else self.saliency_floor_eps,
-                    "saliency/floor_logit": diag.floor_logit_eps if diag is not None else 0.0,
                 })
             if detail is not None:
-                mean_rank = 0.0
-                if detail.query_stats:
-                    mean_rank = sum(float(x.get("mean_annotation_rank", 0.0)) for x in detail.query_stats) / len(detail.query_stats)
                 log_payload.update({
                     "strict_Cbar": detail.avg_C,
                     "strict_Nbar": detail.avg_N,
@@ -248,10 +277,6 @@ class AnnotatedSFTTrainer(Trainer):
                     "strict_recall_at_k": detail.recall_at_k,
                     "strict_precision_at_k": detail.precision_at_k,
                     "strict_map_at_k": detail.map_at_k,
-                    "saliency/recall_at_k": detail.recall_at_k,
-                    "saliency/precision_at_k": detail.precision_at_k,
-                    "saliency/map_at_k": detail.map_at_k,
-                    "saliency/mean_positive_rank": mean_rank,
                 })
             self.log(log_payload)
 
@@ -282,6 +307,10 @@ class DataArguments:
 
 @dataclass
 class SFTTrainingArguments(TrainingArguments):
+    resume_model_only: bool = field(
+        default=False,
+        metadata={"help": "When resuming, load model/trainer state but skip optimizer/scheduler .pt files. Useful with torch<2.6 safety restrictions."}
+    )
     saliency_lambda: float = field(
         default=0.1,
         metadata={"help": "Weight γ in L_total = L_next + γ·L_contrib."}
@@ -325,6 +354,34 @@ class SFTTrainingArguments(TrainingArguments):
     saliency_loss_type: str = field(
         default="softmax_margin",
         metadata={"help": "Saliency objective: softmax_margin log(C+eps)/tau with negative floor, or softmax raw C/tau over all causal sources. Legacy alias infonce_floor is accepted."}
+    )
+    saliency_margin_plus: float = field(
+        default=2.08,
+        metadata={"help": "[margin_bce] Lower-bound margin on log(C+eps) for annotated positives (default log(8))."}
+    )
+    saliency_margin_minus: float = field(
+        default=0.41,
+        metadata={"help": "[margin_bce] Upper-bound margin on log(C+eps) for non-annotated negatives; no penalty once r <= m_minus (default log(1.5))."}
+    )
+    saliency_margin_gamma: float = field(
+        default=2.0,
+        metadata={"help": "[margin_bce] Sharpness of the per-edge softplus (sigmoid gradient slope)."}
+    )
+    saliency_neg_weight: float = field(
+        default=0.5,
+        metadata={"help": "[margin_bce] Multiplier for the negative-side mean penalty."}
+    )
+    saliency_neg_hard_only: bool = field(
+        default=False,
+        metadata={"help": "[margin_bce] If True, the negative-side mean only averages over negatives with r > m_minus."}
+    )
+    saliency_neg_sample_k: int = field(
+        default=0,
+        metadata={"help": "[softmax_margin/softmax/ranknet/contrastive] If >0, sample this many negatives per query for the saliency loss (MoCo-style). 0 = use all causal negatives (default)."}
+    )
+    saliency_source_chunk_size: int = field(
+        default=16,
+        metadata={"help": "Source-token chunk size for saliency contribution rows. Lower values reduce peak memory; use 4 or 2 for long/high-edge samples."}
     )
     loss_mode: str = field(
         default="ce_saliency",
@@ -452,13 +509,20 @@ def train():
         saliency_detail_log_path=training_args.saliency_detail_log_path,
         saliency_detail_log_steps=training_args.saliency_detail_log_steps,
         saliency_detail_top_k=training_args.saliency_detail_top_k,
+        saliency_margin_plus=training_args.saliency_margin_plus,
+        saliency_margin_minus=training_args.saliency_margin_minus,
+        saliency_margin_gamma=training_args.saliency_margin_gamma,
+        saliency_neg_weight=training_args.saliency_neg_weight,
+        saliency_neg_hard_only=training_args.saliency_neg_hard_only,
+        saliency_neg_sample_k=training_args.saliency_neg_sample_k,
+        saliency_source_chunk_size=training_args.saliency_source_chunk_size,
         callbacks=callbacks,
     )
 
     logger.info(
         "Training objective: loss_mode=%s saliency_loss=%s saliency_loss_type=%s "
         "saliency_lambda=%s tau=%s eps_num=%s floor_eps=%s floor_logit_eps=%s floor_mode=%s "
-        "floor_quantile=%s floor_warmup=%s output_dir=%s",
+        "floor_quantile=%s floor_warmup=%s source_chunk=%s neg_sample_k=%s output_dir=%s",
         training_args.loss_mode,
         saliency_loss_display_name(training_args.saliency_loss_type),
         training_args.saliency_loss_type,
@@ -470,9 +534,23 @@ def train():
         training_args.saliency_floor_eps_mode,
         training_args.saliency_floor_quantile,
         training_args.saliency_floor_warmup_steps,
+        training_args.saliency_source_chunk_size,
+        training_args.saliency_neg_sample_k,
         training_args.output_dir,
     )
-    trainer.train()
+    resume_ckpt = getattr(training_args, "resume_from_checkpoint", None)
+    if resume_ckpt:
+        logger.info("Resuming Trainer state from checkpoint: %s", resume_ckpt)
+        if getattr(training_args, "resume_model_only", False):
+            logger.warning(
+                "resume_model_only=True: skipping optimizer/scheduler restore to avoid torch.load safety restriction; "
+                "model weights and Trainer state will still be loaded from the checkpoint."
+            )
+            def _skip_optimizer_and_scheduler(resume_from_checkpoint):
+                logger.warning("Skipped optimizer/scheduler restore from %s", resume_from_checkpoint)
+                return None
+            trainer._load_optimizer_and_scheduler = _skip_optimizer_and_scheduler
+    trainer.train(resume_from_checkpoint=resume_ckpt)
     trainer.save_state()
     trainer.save_model(output_dir=training_args.output_dir)
 
@@ -492,6 +570,8 @@ def train():
             "saliency_floor_ema_beta": training_args.saliency_floor_ema_beta,
             "saliency_floor_min_eps": training_args.saliency_floor_min_eps,
             "saliency_floor_warmup_steps": training_args.saliency_floor_warmup_steps,
+            "saliency_source_chunk_size": training_args.saliency_source_chunk_size,
+            "saliency_neg_sample_k": training_args.saliency_neg_sample_k,
             "data_path": data_args.data_path,
             "model_name_or_path": model_args.model_name_or_path,
             "run_name": training_args.run_name,
@@ -512,6 +592,7 @@ def train():
                 f"- Floor logit epsilon: `{training_args.saliency_floor_logit_eps}`\n"
                 f"- Floor epsilon quantile: `{training_args.saliency_floor_quantile}`\n"
                 f"- Floor epsilon warmup steps: `{training_args.saliency_floor_warmup_steps}`\n"
+                f"- Saliency negative sample K: `{training_args.saliency_neg_sample_k}`\n"
                 f"- Training data: `{data_args.data_path}`\n"
             )
 

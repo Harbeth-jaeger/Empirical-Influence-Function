@@ -40,7 +40,7 @@ def build_chatml_text(row: dict[str, Any]) -> tuple[str, str, str]:
             assistant_content = decode_for_training_chatml(str(msg.get("content", "")))
             break
     if not assistant_content:
-        assistant_content = decode_for_training_chatml(str(row.get("fim_completion", "")))
+        assistant_content = decode_for_training_chatml(str(row.get("fim_completion", row.get("target", ""))))
 
     completion = assistant_content + "<|im_end|>\n"
     return prompt, completion, prompt + completion
@@ -145,6 +145,11 @@ def main() -> None:
 
     print(f"samples: {len(rows)}")
     print(f"aligned: {sum(r['aligned'] for r in rows)} / {len(rows)}")
+    if not rows:
+        raise SystemExit(
+            "No aligned rows to rank. Check that --edge_data_path exists, is non-empty, "
+            "and has the same sample order as --raw_data_path."
+        )
     for key in ["total", "p2c", "p2c_dst_count", "c2c", "p2p"]:
         vals = [int(r[key]) for r in rows]
         print(
