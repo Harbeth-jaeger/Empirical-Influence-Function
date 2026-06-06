@@ -10,8 +10,10 @@ training rows containing `input_ids`, `label`, `attention_edges`, `uid`, and
 cd /home/model_project/Empirical-Influence-Function-go-single-7b
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-annotate.txt
 ```
+
+Use `requirements.txt` only if you also need training/evaluation dependencies.
 
 The tokenizer path must exist locally. By default the scripts use:
 
