@@ -4,19 +4,30 @@ set -euo pipefail
 MODE="${1:-check}"
 
 : "${TRAIN_DATA:?Set TRAIN_DATA to the ChatML/FIM jsonl path. Do not use TRAIN_ DATA with a space.}"
-: "${OPENAI_API_KEY:?Set OPENAI_API_KEY for the Huawei OpenAI-compatible endpoint.}"
+: "${OPENAI_API_KEY:?Set OPENAI_API_KEY for the OpenAI-compatible endpoint.}"
 : "${ANNOTATE_MODEL:?Set ANNOTATE_MODEL to the deployed model name.}"
-: "${HW_APPKEY:?Set HW_APPKEY to the Huawei X-HW-APPKEY value.}"
-: "${HW_OPERATOR:?Set HW_OPERATOR to your work-id/operator value.}"
 
-export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://apigw-cn-southe2.huawei.com/api/v1}"
-export HW_ID="${HW_ID:-com.huawei.ipd.coretool.coreai}"
-export HW_APP_ID="${HW_APP_ID:-$HW_ID}"
-export HW_SCENE="${HW_SCENE:-test}"
-export HW_ENABLE_THINKING="${HW_ENABLE_THINKING:-0}"
+REQUIRE_HUAWEI_GATEWAY="${REQUIRE_HUAWEI_GATEWAY:-1}"
+if [[ "$REQUIRE_HUAWEI_GATEWAY" == "1" ]]; then
+  : "${HW_APPKEY:?Set HW_APPKEY to the Huawei X-HW-APPKEY value.}"
+  : "${HW_OPERATOR:?Set HW_OPERATOR to your work-id/operator value.}"
+  export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://apigw-cn-southe2.huawei.com/api/v1}"
+  export HW_ID="${HW_ID:-com.huawei.ipd.coretool.coreai}"
+  export HW_APP_ID="${HW_APP_ID:-$HW_ID}"
+  export HW_SCENE="${HW_SCENE:-test}"
+  export HW_ENABLE_THINKING="${HW_ENABLE_THINKING:-0}"
+  export ANNOTATE_HTTP_PROXY_NONE="${ANNOTATE_HTTP_PROXY_NONE:-1}"
+  export ANNOTATE_VERIFY_SSL="${ANNOTATE_VERIFY_SSL:-0}"
+else
+  : "${OPENAI_BASE_URL:?Set OPENAI_BASE_URL for local non-Huawei OpenAI-compatible tests.}"
+  unset HW_ID HW_APPKEY HW_APP_ID HW_SCENE HW_OPERATOR
+  unset HUAWEI_HW_ID HUAWEI_HW_APPKEY HUAWEI_APP_ID HUAWEI_SCENE HUAWEI_OPERATOR
+  unset ANNOTATE_EXTRA_HEADERS_JSON ANNOTATE_EXTRA_BODY_JSON
+  export HW_ENABLE_THINKING="${HW_ENABLE_THINKING:-0}"
+  export ANNOTATE_HTTP_PROXY_NONE="${ANNOTATE_HTTP_PROXY_NONE:-0}"
+  export ANNOTATE_VERIFY_SSL="${ANNOTATE_VERIFY_SSL:-1}"
+fi
 
-export ANNOTATE_HTTP_PROXY_NONE="${ANNOTATE_HTTP_PROXY_NONE:-1}"
-export ANNOTATE_VERIFY_SSL="${ANNOTATE_VERIFY_SSL:-0}"
 export ANNOTATE_TEMPERATURE="${ANNOTATE_TEMPERATURE:-0.2}"
 export ANNOTATE_MIN_REQUEST_INTERVAL="${ANNOTATE_MIN_REQUEST_INTERVAL:-1.0}"
 export ANNOTATE_MAX_RETRIES="${ANNOTATE_MAX_RETRIES:-8}"
@@ -56,6 +67,7 @@ echo "output=$OUTPUT_PATH"
 echo "cache=$CACHE_PATH"
 echo "model_path=$MODEL_PATH"
 echo "annotate_model=$ANNOTATE_MODEL"
+echo "require_huawei_gateway=$REQUIRE_HUAWEI_GATEWAY"
 echo "workers=$NUM_WORKERS"
 
 python scripts/go_singleline_fim_exp/annotate_chatml_with_src_annotate.py \
