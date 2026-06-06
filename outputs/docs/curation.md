@@ -327,8 +327,8 @@ External test 用来报告外部 benchmark 主结果，应该尽量选择带 uni
 
 External benchmark 的原则：
 
-- 不改 benchmark 原始数据和官方 test。
-- 只额外生成我们的 ChatML/FIM 推理输入，保留官方 id，方便 prediction 回填。
+- 不改 benchmark 原始数据和官方 test；raw benchmark 只放在 `data/raw_data/`，不直接覆盖或重写。
+- 可以从 raw benchmark 派生我们的 ChatML/FIM 推理输入，保留官方 id，方便 prediction 回填。
 - 不做 causality curation annotation，也不报告 saliency alignment。
 - 主报告 completion quality，尤其是 pass@k。
 - 如果 benchmark 没有 unit test，则只能作为补充相似度评测，不能作为 external 主结果。
@@ -336,11 +336,13 @@ External benchmark 的原则：
 推荐 external 主表优先使用 execution benchmark。
 
 
-| Benchmark                     | 语言        | 是否有 unit test / judge | 推荐主指标    | 备注                                              |
-| ----------------------------- | ----------- | ------------------------ | ------------- | ------------------------------------------------- |
-| MCEval-Go / Go subset         | Go          | 有                       | pass@1/pass@k | 和当前 Go completion 场景最接近，适合短期主结果。 |
-| xCodeEval-Go / ExecEval       | Go / 多语言 | 有                       | pass@1/pass@k | 更标准的可执行代码评测，适合外部 benchmark。      |
-| HumanEval / MBPP 类 benchmark | Python 为主 | 有                       | pass@1/pass@k | 权威但语言和当前 Go 训练不完全一致，可作补充。    |
+| Benchmark                     | 语言        | 是否有 unit test / judge | 推荐主指标    | 备注                                                                                           |
+| ----------------------------- | ----------- | ------------------------ | ------------- | ---------------------------------------------------------------------------------------------- |
+| MCEval-Go / Go subset         | Go          | 有                       | pass@1/pass@k | 和当前 Go completion 场景最接近，适合短期主结果。                                              |
+| MultiPL-E Go body-mask derived eval | Go / 多语言 | 有                 | pass@1/pass@k | MultiPL-E HF 数据不含 Go canonical solution，当前先构造函数体 `[MASK]` 评测样本；论文中必须说明不是官方 generation 协议。 |
+| HumanEval-X Go derived FIM    | Go / 多语言 | 有                       | pass@1/pass@k | 从 HumanEval-X Go 样本派生单语句 FIM；保留官方 test，使用自建兼容 judge。                      |
+| xCodeEval-Go / ExecEval       | Go / 多语言 | 有                       | pass@1/pass@k | 更标准的可执行代码评测，适合外部 benchmark。                                                   |
+| HumanEval / MBPP 类 benchmark | Python 为主 | 有                       | pass@1/pass@k | 权威但语言和当前 Go 训练不完全一致，可作补充。                                                 |
 
 没有 unit test 的 completion benchmark 可以作为 external supplementary，不建议放在主表。
 
@@ -366,6 +368,194 @@ candidate_code = prefix + prediction + suffix
 ```
 
 然后把 `candidate_code` 和 benchmark 原始 `test/judge_payload` 一起交给官方或兼容 judge。不能用字段精确匹配冒充 pass@k。
+
+#### 当前外部 benchmark 来源
+
+当前短期外部评测优先使用两个权威多语言 execution benchmark，并只在实验协议层面派生 Go `[MASK]` 任务；其中 HumanEval-X 可派生 single-statement FIM，MultiPL-E 当前只能派生 body-mask eval。
+
+1. **MultiPL-E**
+
+   - 官网 / 文档页：`https://nuprl.github.io/MultiPL-E/`
+   - GitHub：`https://github.com/nuprl/MultiPL-E`
+   - 论文：`https://arxiv.org/pdf/2208.08227`
+   - 数据来源：Hugging Face dataset `nuprl/MultiPL-E`
+   - 原始定位：将 HumanEval 和 MBPP 翻译到多种编程语言，用 unit tests 评估多语言 code generation。
+2. **HumanEval-X**
+
+   - CodeGeeX GitHub：`https://github.com/zai-org/CodeGeeX`
+   - evaluator 说明：`https://github.com/open-compass/code-evaluator`
+   - 论文页：`https://huggingface.co/papers/2303.17568`
+   - arXiv：`https://arxiv.org/abs/2303.17568`
+   - 数据来源：Hugging Face dataset `zai-org/humaneval-x`
+   - 原始定位：基于 HumanEval 构建的多语言 benchmark，包含 Python、C++、Java、JavaScript、Go，每个样本带 solution 和 test cases。
+
+原始数据下载到：
+
+```text
+data/raw_data/multipl_e/
+data/raw_data/humaneval_x/
+```
+
+推荐下载命令为：
+
+```bash
+cd /mnt/nvme0n1/wenhao/Empirical-Influence-Function
+
+export PATH="$PWD/.local/bin:$PATH"
+eval "$($PWD/.local/bin/micromamba shell hook -s bash 2>/dev/null || micromamba shell hook -s bash)"
+export MAMBA_ROOT_PREFIX="$PWD/.micromamba"
+micromamba activate "$PWD/.micromamba/envs/eif-bench"
+
+mkdir -p data/raw_data/multipl_e
+hf download nuprl/MultiPL-E \
+  --repo-type dataset \
+  --include "humaneval-*/*.parquet" \
+  --include "mbpp-*/*.parquet" \
+  --local-dir data/raw_data/multipl_e
+
+mkdir -p data/raw_data/humaneval_x
+hf download zai-org/humaneval-x \
+  --repo-type dataset \
+  --include "data/*/data/*.jsonl" \
+  --local-dir data/raw_data/humaneval_x
+```
+
+这里下载的是 Hugging Face dataset 中的数据文件，不是整个 GitHub 仓库。MultiPL-E 的 `.parquet` 是 Hugging Face 常用的列式数据格式，可以直接用 `pandas.read_parquet` 读取，也可以转换为 JSONL。
+
+#### Derived Go FIM 协议
+
+由于 MultiPL-E 和 HumanEval-X 的官方协议主要是 unit-test-driven code generation，而我们的训练任务是 Go single-statement FIM completion，因此外部 benchmark 不直接按官方 generation prompt 评测，而是构造成 derived benchmark：
+
+```text
+benchmark raw sample
+  -> 抽取 prompt / declaration / canonical_solution / tests / entry_point / language
+  -> 拼出 reference full function 或 full program
+  -> 定位 Go entry function
+  -> 去掉或过滤含注释、docstring 的函数
+  -> HumanEval-X: 从函数体内抽取完整单行 statement 作为 target，构造 prefix / target / suffix
+  -> MultiPL-E: 因 raw 数据无 canonical_solution，构造 func signature + [MASK] + closing brace 的 body-mask 样本
+  -> render 成项目统一 ChatML-MASK 格式
+  -> model.generate 得到 completion
+  -> 后处理 completion
+  -> 拼回 candidate_code = prefix + prediction + suffix
+  -> 运行官方 tests 或自建兼容 Go judge
+  -> 统计 pass@1 / pass@k / CodeBLEU
+```
+
+论文中应明确说明：这里报告的是 **MultiPL-E-derived Go body-mask eval** 和 **HumanEval-X-derived Go FIM**，不是官方 MultiPL-E / HumanEval-X generation protocol 的直接结果。MultiPL-E 的 Hugging Face parquet 只有 `prompt/tests/stop_tokens`，没有 Go `canonical_solution`，因此不能从 raw 数据直接抽取带 gold target 的单语句 FIM；如果后续额外接入可靠 Go reference solution map，可以再升级为 single-statement derived FIM。
+
+派生后的数据放在：
+
+```text
+data/go_single_fim/test_data/multipl_e/
+data/go_single_fim/test_data/humaneval_x/
+```
+
+建议输出文件为：
+
+```text
+data/go_single_fim/test_data/multipl_e/multipl_e_go_bodymask_canonical.jsonl
+data/go_single_fim/test_data/multipl_e/multipl_e_go_bodymask_chatml.jsonl
+data/go_single_fim/test_data/humaneval_x/humaneval_x_go_derived_canonical.jsonl
+data/go_single_fim/test_data/humaneval_x/humaneval_x_go_derived_chatml.jsonl
+```
+
+canonical schema 建议统一为：
+
+```json
+{
+  "uid": "humaneval_x_go_xxx",
+  "source_dataset": "humaneval_x_go",
+  "split": "test",
+  "language": "go",
+  "task_type": "go_single_statement_completion_derived",
+  "prefix": "...",
+  "target": "...",
+  "suffix": "...",
+  "full_code": "...",
+  "target_kind": "assignment|return|call",
+  "metadata": {
+    "raw_task_id": "...",
+    "entry_point": "...",
+    "source_benchmark": "HumanEval-X",
+    "derivation": "comment_free_single_statement_mask",
+    "target_line": 12,
+    "filters": ["no_comments", "single_line", "assignment"]
+  },
+  "judge_payload": {
+    "kind": "derived_humaneval_x_go_test",
+    "tests": "...",
+    "entry_point": "...",
+    "raw_sample": {}
+  }
+}
+```
+
+ChatML 渲染必须沿用训练数据中的固定话术：
+
+```text
+system:
+You are a Go code completion assistant.
+
+user:
+Fill the [MASK] in the Go function. Return only the missing Go code, without Markdown fences or explanation.
+
+* Incomplete Code:
+{prefix}[MASK]{suffix}
+
+assistant:
+{target}
+```
+
+评测时只把 system/user 喂给模型，assistant 的 `target` 只用于 teacher forcing、CodeBLEU 或 debug。
+
+#### 派生样本过滤与后处理
+
+派生样本应尽量复用 GoSingle 的过滤原则：
+
+- 只保留 Go。
+- 只保留能定位到 entry function 的样本。
+- 函数体、target 语句和模型输入里不应含普通注释或 docstring。
+- 只抽完整单行 statement，优先 `assignment`、`return`、`call`。
+- 拒绝 `if/for/switch/select` 等 block header，拒绝包含 `{` 或 `}` 的 target。
+- 拒绝 `return nil`、`return err`、`break`、`continue`、`panic` 等信息量低或控制流强的 target。
+- HumanEval-X 每个 raw benchmark task 建议最多保留 `per_task=1` 个派生 mask，避免一个原始题目被多个 mask 放大权重；内部分析可使用 `per_task=3`。
+- MultiPL-E 当前是 body-mask eval，`target` 和 `full_code` 为空，`metadata.target_available=false`，只用于 pass@k，不用于 span-level CodeBLEU。
+
+生成后处理建议：
+
+```text
+raw_generation
+  -> 截断 <|im_end|> / <|endoftext|> / <|im_start|> 等 special token
+  -> 去掉 Markdown fences
+  -> 如果输出重复了 prompt 或 [MASK] 上下文，抽取缺失片段
+  -> 对 single-statement derived task，只保留第一条完整 Go statement
+  -> candidate_code = prefix + clean_prediction + suffix
+  -> gofmt 只做格式化，不做语义修复
+  -> Go unit tests / compatible judge
+```
+
+自建 evaluator 应至少区分：
+
+```text
+ok
+format_error
+compile_error
+test_failure
+timeout
+unsupported
+missing_prediction
+```
+
+pass@k 的统计方式保持 execution benchmark 口径：
+
+```text
+对每个 derived sample 生成 k 个 candidate。
+只要至少 1 个 candidate 拼回后通过 tests，则该 sample pass@k = 1。
+最终 pass@k = 通过样本数 / 可评测样本数。
+```
+
+如果一个 raw task 派生多个 mask，报告时应额外说明统计单位是 `derived sample` 还是 `raw task`；论文主表建议 HumanEval-X 优先使用 `per_task=1`，使二者基本一致。
 
 ### 5. 数据处理与评测输出约定
 
