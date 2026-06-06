@@ -7,6 +7,7 @@ import random
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 _key_file = Path("./data/openai_key.txt")
 if not os.environ.get("OPENAI_API_KEY") and _key_file.exists():
@@ -19,6 +20,85 @@ _OPENAI_LAST_REQUEST_TS = 0.0
 _OPENAI_CLIENT_LOCAL = threading.local()
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _optional_env_flag(*names: str) -> bool | None:
+    for name in names:
+        if name in os.environ:
+            return _env_flag(name)
+    return None
+
+
+def _json_object_env(name: str) -> dict[str, Any]:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return {}
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{name} must be a JSON object")
+    return parsed
+
+
+def _annotation_extra_headers() -> dict[str, str]:
+    headers = {str(k): str(v) for k, v in _json_object_env("ANNOTATE_EXTRA_HEADERS_JSON").items()}
+    hw_id = os.environ.get("HW_ID") or os.environ.get("HUAWEI_HW_ID")
+    hw_appkey = os.environ.get("HW_APPKEY") or os.environ.get("HUAWEI_HW_APPKEY")
+    if hw_id:
+        headers.setdefault("X-HW-ID", hw_id)
+    if hw_appkey:
+        headers.setdefault("X-HW-APPKEY", hw_appkey)
+    return headers
+
+
+def _annotation_extra_body() -> dict[str, Any]:
+    body = _json_object_env("ANNOTATE_EXTRA_BODY_JSON")
+    hw_id = os.environ.get("HW_ID") or os.environ.get("HUAWEI_HW_ID")
+    app_id = os.environ.get("HW_APP_ID") or os.environ.get("HUAWEI_APP_ID") or hw_id
+    scene = os.environ.get("HW_SCENE") or os.environ.get("HUAWEI_SCENE")
+    operator = os.environ.get("HW_OPERATOR") or os.environ.get("HUAWEI_OPERATOR")
+    if app_id:
+        body.setdefault("appId", app_id)
+    if scene:
+        body.setdefault("scene", scene)
+    if operator:
+        body.setdefault("operator", operator)
+
+    enable_thinking = _optional_env_flag("HW_ENABLE_THINKING", "HUAWEI_ENABLE_THINKING")
+    if enable_thinking is not None:
+        chat_template_kwargs = dict(body.get("chat_template_kwargs") or {})
+        chat_template_kwargs.setdefault("enable_thinking", enable_thinking)
+        body["chat_template_kwargs"] = chat_template_kwargs
+    return body
+
+
+def _build_openai_client() -> OpenAI:
+    kwargs: dict[str, Any] = {}
+    if os.environ.get("OPENAI_API_KEY"):
+        kwargs["api_key"] = os.environ["OPENAI_API_KEY"]
+    if os.environ.get("OPENAI_BASE_URL"):
+        kwargs["base_url"] = os.environ["OPENAI_BASE_URL"]
+
+    disable_proxy = _env_flag("ANNOTATE_HTTP_PROXY_NONE") or _env_flag("HUAWEI_DISABLE_PROXY")
+    verify_ssl = _env_flag("ANNOTATE_VERIFY_SSL", default=True)
+    if _env_flag("HUAWEI_INSECURE"):
+        verify_ssl = False
+    if disable_proxy or not verify_ssl:
+        try:
+            import httpx
+        except ImportError as exc:
+            raise RuntimeError("Install httpx to use custom Huawei/OpenAI HTTP transport") from exc
+        transport_kwargs: dict[str, Any] = {"verify": verify_ssl}
+        if disable_proxy:
+            transport_kwargs["proxy"] = None
+        kwargs["http_client"] = httpx.Client(transport=httpx.HTTPTransport(**transport_kwargs))
+    return OpenAI(**kwargs)
+
+
 def get_thread_local_openai_client() -> OpenAI:
     """Reuse one OpenAI client per worker thread.
 
@@ -28,7 +108,7 @@ def get_thread_local_openai_client() -> OpenAI:
     """
     client = getattr(_OPENAI_CLIENT_LOCAL, "client", None)
     if client is None:
-        client = OpenAI()
+        client = _build_openai_client()
         _OPENAI_CLIENT_LOCAL.client = client
     return client
 
@@ -46,6 +126,21 @@ def _rate_limited_chat_completion(client: OpenAI, **kwargs):
     request_timeout = os.environ.get("ANNOTATE_REQUEST_TIMEOUT")
     if request_timeout and "timeout" not in kwargs:
         kwargs["timeout"] = float(request_timeout)
+    request_temperature = os.environ.get("ANNOTATE_TEMPERATURE")
+    if request_temperature is not None and "temperature" in kwargs:
+        kwargs["temperature"] = float(request_temperature)
+
+    extra_headers = _annotation_extra_headers()
+    if extra_headers:
+        merged_headers = dict(extra_headers)
+        merged_headers.update(kwargs.get("extra_headers") or {})
+        kwargs["extra_headers"] = merged_headers
+
+    extra_body = _annotation_extra_body()
+    if extra_body:
+        merged_body = dict(extra_body)
+        merged_body.update(kwargs.get("extra_body") or {})
+        kwargs["extra_body"] = merged_body
 
     for attempt in range(max_retries + 1):
         with _OPENAI_RATE_LOCK:

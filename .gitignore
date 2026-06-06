@@ -252,6 +252,7 @@ outputs/**/checkpoint-*/
 # Ignore generated/non-code file suffixes for code-only branches.
 *.jinja
 *.md
+!docs/huawei_annotation_runbook.md
 *.jsonl
 *.json
 *.html

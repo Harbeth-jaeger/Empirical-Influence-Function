@@ -13,6 +13,8 @@ jsonlines
 pandas
 datasets
 accelerate
+openai
+httpx
 tree_sitter
 tree_sitter_go
 torchvision
