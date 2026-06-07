@@ -5,7 +5,7 @@ MODE="${1:-check}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
-RAW_DATA="${HUAWEI_RAW_DATA:-${RAW_DATA:-data/huawei_data/cloud_core_test_25.JunJunly_GoOnly_length_filter.jsonl}}"
+RAW_DATA="${HUAWEI_RAW_DATA:-${RAW_DATA:-${TRAIN_DATA:-data/huawei_data/cloud_core_test_25.JunJunly_GoOnly_length_filter.jsonl}}}"
 PROCESSED_DIR="${HUAWEI_PROCESSED_DIR:-data/huawei_data/processed}"
 RAW_BASENAME="$(basename "$RAW_DATA")"
 RAW_STEM="${RAW_BASENAME%.*}"
@@ -43,7 +43,7 @@ Modes:
   all        prepare -> validate -> check -> optional visualize -> full annotation.
 
 Important env vars:
-  HUAWEI_RAW_DATA       Raw Huawei JSONL path. Default: data/huawei_data/cloud_core_test_25.JunJunly_GoOnly_length_filter.jsonl
+  HUAWEI_RAW_DATA       Raw Huawei JSONL path. Fallbacks: RAW_DATA, TRAIN_DATA, then local default.
   HUAWEI_CHATML_DATA    Converted ChatML output path.
   HUAWEI_CANONICAL_DATA Converted canonical output path.
   FORCE_PREPARE=1      Rebuild converted data even if outputs already exist.
