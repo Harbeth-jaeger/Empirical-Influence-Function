@@ -109,7 +109,7 @@ prepare() {
 
 validate() {
   log "validate input=$CHATML_DATA limit=$VALIDATE_LIMIT"
-  python scripts/go_singleline_fim_exp/check_chatml_fim_input.py \
+  python scripts/huawei_deploy/check_chatml_fim_input.py \
     --input_path "$CHATML_DATA" \
     --limit "$VALIDATE_LIMIT"
 }
@@ -126,31 +126,73 @@ require_api_env() {
   fi
 }
 
+configure_api_env() {
+  local require_huawei="${REQUIRE_HUAWEI_GATEWAY:-1}"
+  if [[ "$require_huawei" == "1" ]]; then
+    export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://apigw-cn-southe2.huawei.com/api/v1}"
+    export HW_ID="${HW_ID:-com.huawei.ipd.coretool.coreai}"
+    export HW_APP_ID="${HW_APP_ID:-$HW_ID}"
+    export HW_SCENE="${HW_SCENE:-test}"
+    export HW_ENABLE_THINKING="${HW_ENABLE_THINKING:-0}"
+    export ANNOTATE_HTTP_PROXY_NONE="${ANNOTATE_HTTP_PROXY_NONE:-1}"
+    export ANNOTATE_VERIFY_SSL="${ANNOTATE_VERIFY_SSL:-0}"
+  else
+    unset HW_ID HW_APPKEY HW_APP_ID HW_SCENE HW_OPERATOR
+    unset HUAWEI_HW_ID HUAWEI_HW_APPKEY HUAWEI_APP_ID HUAWEI_SCENE HUAWEI_OPERATOR
+    unset ANNOTATE_EXTRA_HEADERS_JSON ANNOTATE_EXTRA_BODY_JSON
+    export HW_ENABLE_THINKING="${HW_ENABLE_THINKING:-0}"
+    export ANNOTATE_HTTP_PROXY_NONE="${ANNOTATE_HTTP_PROXY_NONE:-0}"
+    export ANNOTATE_VERIFY_SSL="${ANNOTATE_VERIFY_SSL:-1}"
+  fi
+
+  export ANNOTATE_TEMPERATURE="${ANNOTATE_TEMPERATURE:-0.2}"
+  export ANNOTATE_MIN_REQUEST_INTERVAL="${ANNOTATE_MIN_REQUEST_INTERVAL:-1.0}"
+  export ANNOTATE_MAX_RETRIES="${ANNOTATE_MAX_RETRIES:-8}"
+  export ANNOTATE_RETRY_BASE_SLEEP="${ANNOTATE_RETRY_BASE_SLEEP:-10}"
+  export ANNOTATE_MAX_TOKENS="${ANNOTATE_MAX_TOKENS:-2048}"
+}
+
+run_annotation() {
+  local mode="$1"
+  local run_name="$2"
+  local max_rows="$3"
+  local overwrite_args=()
+  local max_rows_args=()
+  if [[ "$mode" == "check" ]]; then
+    max_rows_args=(--max_rows "$max_rows")
+    overwrite_args=(--overwrite_cache)
+  elif [[ "$mode" != "full" ]]; then
+    echo "run_annotation mode must be check or full, got: $mode" >&2
+    exit 2
+  fi
+
+  configure_api_env
+  mkdir -p "$OUT_DIR" "$RUN_DIR"
+  local output_path="${OUTPUT_PATH:-$OUT_DIR/${run_name}_compact.jsonl}"
+  local cache_path="${CACHE_PATH:-$RUN_DIR/${run_name}.annotation_cache.jsonl}"
+
+  echo "mode=$mode"
+  echo "input=$CHATML_DATA"
+  echo "output=$output_path"
+  echo "cache=$cache_path"
+  echo "model_path=$MODEL_PATH"
+  echo "annotate_model=$ANNOTATE_MODEL"
+  echo "require_huawei_gateway=${REQUIRE_HUAWEI_GATEWAY:-1}"
+  echo "workers=${NUM_WORKERS:-4}"
+
+  python scripts/go_singleline_fim_exp/annotate_chatml_with_src_annotate.py     --input_path "$CHATML_DATA"     --output_path "$output_path"     --model_name_or_path "$MODEL_PATH"     "${max_rows_args[@]}"     --num_workers "${NUM_WORKERS:-4}"     --annotation_mode "$ANNOTATION_MODE"     --max_rounds "${MAX_ROUNDS:-6}"     --annotation_cache_path "$cache_path"     --flush_every "${FLUSH_EVERY:-20}"     "${overwrite_args[@]}"
+}
+
 annotate_check() {
   require_api_env
   log "annotate check rows=$CHECK_ROWS run=$CHECK_RUN_NAME"
-  TRAIN_DATA="$CHATML_DATA" \
-  RUN_NAME="$CHECK_RUN_NAME" \
-  MAX_ROWS="$CHECK_ROWS" \
-  MODEL_PATH="$MODEL_PATH" \
-  OUT_DIR="$OUT_DIR" \
-  RUN_DIR="$RUN_DIR" \
-  ANNOTATION_MODE="$ANNOTATION_MODE" \
-  REQUIRE_HUAWEI_GATEWAY="${REQUIRE_HUAWEI_GATEWAY:-1}" \
-  bash scripts/go_singleline_fim_exp/run_huawei_annotation.sh check
+  run_annotation check "$CHECK_RUN_NAME" "$CHECK_ROWS"
 }
 
 annotate_full() {
   require_api_env
   log "annotate full run=$FULL_RUN_NAME"
-  TRAIN_DATA="$CHATML_DATA" \
-  RUN_NAME="$FULL_RUN_NAME" \
-  MODEL_PATH="$MODEL_PATH" \
-  OUT_DIR="$OUT_DIR" \
-  RUN_DIR="$RUN_DIR" \
-  ANNOTATION_MODE="$ANNOTATION_MODE" \
-  REQUIRE_HUAWEI_GATEWAY="${REQUIRE_HUAWEI_GATEWAY:-1}" \
-  bash scripts/go_singleline_fim_exp/run_huawei_annotation.sh full
+  run_annotation full "$FULL_RUN_NAME" "0"
 }
 
 visualize() {

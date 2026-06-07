@@ -62,7 +62,7 @@ export ANNOTATE_EXTRA_HEADERS_JSON='{"Header-Name":"value"}'
 ## 3. Validate input shape
 
 ```bash
-python scripts/go_singleline_fim_exp/check_chatml_fim_input.py \
+python scripts/huawei_deploy/check_chatml_fim_input.py \
   --input_path "$TRAIN_DATA" \
   --limit 100
 ```
@@ -80,7 +80,7 @@ export NUM_WORKERS=2
 export ANNOTATION_MODE=agent
 export RUN_NAME=cloud_core_go_20_huawei
 
-nohup bash scripts/go_singleline_fim_exp/run_huawei_annotation.sh check \
+nohup bash scripts/huawei_deploy/annotate.sh check \
   > runs/go_singleline_fim_exp/huawei_annotation/${RUN_NAME}.log 2>&1 &
 ```
 
@@ -139,7 +139,7 @@ export RUN_NAME=cloud_core_go_full_huawei
 export NUM_WORKERS=4
 export ANNOTATION_MODE=agent
 
-nohup bash scripts/go_singleline_fim_exp/run_huawei_annotation.sh full \
+nohup bash scripts/huawei_deploy/annotate.sh full \
   > runs/go_singleline_fim_exp/huawei_annotation/${RUN_NAME}.log 2>&1 &
 ```
 
