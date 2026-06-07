@@ -118,6 +118,57 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return "429" in text or "too many requests" in text or "rate limit" in text
 
 
+def _chat_response_message(response: Any) -> Any | None:
+    if isinstance(response, str):
+        return None
+    choices = getattr(response, "choices", None)
+    if not choices and isinstance(response, dict):
+        choices = response.get("choices")
+    if not choices:
+        return None
+    first = choices[0]
+    if isinstance(first, dict):
+        return first.get("message") or first.get("delta") or first
+    return getattr(first, "message", None) or first
+
+
+def _chat_response_text(response: Any) -> str:
+    if isinstance(response, str):
+        return response
+    msg = _chat_response_message(response)
+    if msg is None:
+        return ""
+    if isinstance(msg, str):
+        return msg
+    if isinstance(msg, dict):
+        content = msg.get("content", "")
+    else:
+        content = getattr(msg, "content", "")
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text") or item.get("content") or ""))
+            else:
+                parts.append(str(item))
+        return "".join(parts)
+    return str(content or "")
+
+
+def _chat_response_finish_reason(response: Any) -> str:
+    if isinstance(response, str):
+        return "stop"
+    choices = getattr(response, "choices", None)
+    if not choices and isinstance(response, dict):
+        choices = response.get("choices")
+    if not choices:
+        return ""
+    first = choices[0]
+    if isinstance(first, dict):
+        return str(first.get("finish_reason") or "")
+    return str(getattr(first, "finish_reason", "") or "")
+
+
 def _rate_limited_chat_completion(client: OpenAI, **kwargs):
     global _OPENAI_LAST_REQUEST_TS
     min_interval = float(os.environ.get("ANNOTATE_MIN_REQUEST_INTERVAL", "1.2"))
@@ -1114,8 +1165,7 @@ class AnnotatorAgent:
                 max_tokens=int(os.environ.get("ANNOTATE_MAX_TOKENS", "2048")),
             )
 
-        msg = response.choices[0].message
-        content = getattr(msg, "content", "") or ""
+        content = _chat_response_text(response)
         for pair in self._extract_pairs_from_text(content):
             try:
                 i = int(pair.get("i", pair.get("src", pair.get("source"))))
@@ -1327,10 +1377,18 @@ class AnnotatorAgent:
                         ts_char_offset=ts_char_offset,
                     )
                 raise
-            msg = response.choices[0].message
+            msg = _chat_response_message(response)
+            if msg is None:
+                return self._annotate_without_tools(
+                    code,
+                    subwords,
+                    target_indices=target_indices,
+                    ts_code=ts_code,
+                    ts_char_offset=ts_char_offset,
+                )
             messages.append(msg)
 
-            finish_reason = response.choices[0].finish_reason
+            finish_reason = _chat_response_finish_reason(response)
 
             if finish_reason == "stop":
                 messages.append({"role": "user",
@@ -1338,14 +1396,23 @@ class AnnotatorAgent:
                                             "Do not end without calling it."})
                 continue
 
-            if not msg.tool_calls:
+            tool_calls = msg.get("tool_calls") if isinstance(msg, dict) else getattr(msg, "tool_calls", None)
+            if not tool_calls:
                 continue
 
             tool_results = []
             done = False
-            for tc in msg.tool_calls:
-                name = tc.function.name
-                inputs = json.loads(tc.function.arguments)
+            for tc in tool_calls:
+                if isinstance(tc, dict):
+                    fn = tc.get("function") or {}
+                    name = fn.get("name") or tc.get("name")
+                    arguments = fn.get("arguments") or tc.get("arguments") or "{}"
+                    tool_call_id = tc.get("id", name or "tool_call")
+                else:
+                    name = tc.function.name
+                    arguments = tc.function.arguments
+                    tool_call_id = tc.id
+                inputs = json.loads(arguments)
 
                 result = self._execute_tool(name, inputs, code, subwords,
                                             ts_code=ts_code, ts_char_offset=ts_char_offset)
@@ -1389,7 +1456,7 @@ class AnnotatorAgent:
 
                 tool_results.append({
                     "role": "tool",
-                    "tool_call_id": tc.id,
+                    "tool_call_id": tool_call_id,
                     "content": result,
                 })
 
