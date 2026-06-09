@@ -18,6 +18,8 @@ STRIP_CJK_COMMENTS="${STRIP_CJK_COMMENTS:-1}"
 MAX_TARGET_NONEMPTY_LINES="${MAX_TARGET_NONEMPTY_LINES:-10}"
 MAX_TARGET_ROUGH_TOKENS="${MAX_TARGET_ROUGH_TOKENS:-192}"
 MAX_TARGET_CHARS="${MAX_TARGET_CHARS:-1024}"
+FILTER_GOFMT_VALID="${FILTER_GOFMT_VALID:-1}"
+GOFMT_BIN="${GOFMT_BIN:-gofmt}"
 VALIDATE_LIMIT="${VALIDATE_LIMIT:-100}"
 CHECK_ROWS="${CHECK_ROWS:-50}"
 FORCE_PREPARE="${FORCE_PREPARE:-0}"
@@ -53,6 +55,8 @@ Important env vars:
   MAX_TARGET_NONEMPTY_LINES=N  Reject long targets by non-empty line count; default: 10.
   MAX_TARGET_ROUGH_TOKENS=N    Reject long targets by rough token count; default: 192.
   MAX_TARGET_CHARS=N           Reject long targets by char count; default: 1024.
+  FILTER_GOFMT_VALID=1 Reject samples whose prefix+target+suffix is not parseable by gofmt; default: 1.
+  GOFMT_BIN=gofmt      gofmt executable for syntax quality filtering.
   CHECK_ROWS=50        Number of rows for check mode.
   ENABLE_VISUALIZE=1   Build viewer after check/all; default: 1.
   VIS_OUT_DIR=PATH     Visualization CSV/HTML output dir. Default: outputs/huawei_deploy
@@ -95,10 +99,13 @@ prepare() {
   if [[ "$MAX_TARGET_CHARS" != "0" ]]; then
     max_args+=(--max-target-chars "$MAX_TARGET_CHARS")
   fi
+  if [[ "$FILTER_GOFMT_VALID" == "1" ]]; then
+    max_args+=(--filter-gofmt-valid --gofmt-bin "$GOFMT_BIN")
+  fi
   log "prepare raw=$RAW_DATA"
   log "prepare chatml=$CHATML_DATA"
   log "prepare canonical=$CANONICAL_DATA"
-  log "prepare cleaning strip_cjk_comments=$STRIP_CJK_COMMENTS max_lines=$MAX_TARGET_NONEMPTY_LINES max_tokens=$MAX_TARGET_ROUGH_TOKENS max_chars=$MAX_TARGET_CHARS max_accepted=$PREPARE_MAX_ACCEPTED_ROWS"
+  log "prepare cleaning strip_cjk_comments=$STRIP_CJK_COMMENTS max_lines=$MAX_TARGET_NONEMPTY_LINES max_tokens=$MAX_TARGET_ROUGH_TOKENS max_chars=$MAX_TARGET_CHARS filter_gofmt_valid=$FILTER_GOFMT_VALID gofmt_bin=$GOFMT_BIN max_accepted=$PREPARE_MAX_ACCEPTED_ROWS"
   python scripts/huawei_deploy/build_huawei_fim_chatml.py \
     --input-path "$RAW_DATA" \
     --chatml-output "$CHATML_DATA" \

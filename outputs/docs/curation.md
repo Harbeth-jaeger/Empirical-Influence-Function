@@ -2118,3 +2118,87 @@ SAFIM:
 ```
 
 因此，正式 benchmark pipeline 中 HumanEval-Infilling 部分已经可以作为完整 official evaluation 链路使用；SAFIM 的数据 adapter 已验证，但 official execution backend 仍需单独解决。
+
+#### 9.1 正式 train mixture 的当前决策
+
+Go single-line FIM 数据已经完成了一轮调试和探索，但它不再作为正式 paper benchmark 的主训练设定。正式评测阶段需要围绕两个原生 code completion / code infilling benchmark 构造 train-test task match 的训练混合：
+
+```text
+HumanEval-Infilling:
+  train data source: MBPP + APPS
+
+SAFIM:
+  train data source: The Stack
+```
+
+这里的原则是：benchmark 本身不改动，训练数据可以从其他高质量代码数据中派生，但派生后的输入输出形式必须尽量贴近 benchmark 的原生任务形态。
+
+#### 9.2 HumanEval-Infilling train mixture 要求
+
+HumanEval-Infilling 是 Python-only、function-level 的 FIM benchmark。它的样本通常是一个带 docstring 的 Python 函数，docstring 中包含任务描述、约束和示例；mask 位于函数体内部，主要包含 single-line、multi-line、random-span 和 random-span-light 几类场景。
+
+因此，HumanEval-Infilling 的训练数据不能只从普通裸函数中随机挖空。更合理的训练 mixture 应该具备：
+
+1. Python 语言。
+2. function-level 样本。
+3. 函数前部或函数内部包含自然语言任务描述，最好包含 examples / asserts / tests。
+4. mask 覆盖 single-line statement、multi-line block，以及少量 random-span。
+5. 与 HumanEval test problem 不同源，避免 test contamination。
+
+当前选择 `MBPP + APPS` 作为最小可行训练源：
+
+- `MBPP`：每条样本包含自然语言题目描述、Python reference solution 和测试断言，形态上最接近 HumanEval 的“问题描述 -> 函数实现”。它适合构造带 docstring 的 function-level FIM，尤其适合 single-line 和较短 multi-line mask。
+- `APPS`：包含更复杂的编程题、标准答案和测试，算法结构比 MBPP 更丰富。它适合补充 HumanEval multi-line 场景中常见的循环、条件、状态更新和算法主体代码。
+
+后续构造方式建议：
+
+1. 将 MBPP / APPS 的题目描述、输入输出说明、examples 或 tests 整理为 Python docstring。
+2. 将 reference solution 规范化为可解析 Python code。
+3. 对每个函数构造 `prefix + [MASK] + suffix -> target`。
+4. 按 task type 保留字段，例如 `single_line`、`multi_line`、`random_span`。
+5. 优先保证 single-line 和 multi-line 的质量；random-span 可以先做轻量版本，不必完全复刻 HumanEval 的随机挖空分布。
+
+#### 9.3 SAFIM train mixture 要求
+
+SAFIM 是 syntax-aware FIM benchmark，强调 file-level / script-level 代码补全，并按结构化场景评估：
+
+```text
+algorithmic_block
+control_flow_expression
+api_function_call
+```
+
+因此，SAFIM 的训练数据需要尽量保留完整文件上下文，而不是只保留单个函数片段。它的训练 mixture 应该具备：
+
+1. 覆盖 Python、Java、C++、C#。
+2. file-level 或接近 file-level 的代码上下文。
+3. mask 位置由语法结构决定，而不是纯随机字符 span。
+4. task type 能区分算法块、控制流条件表达式和 API 调用。
+5. 尽量使用 permissive license 数据，便于论文和后续复现说明。
+
+当前选择 `The Stack` 作为最小可行训练源：
+
+- `The Stack` 覆盖多语言、文件级代码，包含 Python、Java、C++、C#，和 SAFIM 的多语言 file-level 设置更匹配。
+- 它比 CodeSearchNet 更适合 SAFIM，因为 CodeSearchNet 主要是 function-level docstring-code pair，缺少 C++ / C#，也不天然保留完整文件上下文。
+- 它适合通过 AST / tree-sitter 规则构造 syntax-aware mask，例如隐藏控制流表达式、API call expression、循环体或关键算法块。
+
+后续构造方式建议：
+
+1. 从 The Stack 中按语言抽取 Python / Java / C++ / C# 文件。
+2. 使用 tree-sitter 或语言 parser 解析文件。
+3. 根据 AST node 类型构造三类 mask：
+   - `algorithmic_block`：循环体、条件分支体、函数内关键 statement block。
+   - `control_flow_expression`：`if` / `elif` / `while` / `for` 中的条件或控制表达式。
+   - `api_function_call`：函数调用表达式、方法调用表达式、库 API 调用。
+4. 过滤不可解析、过短、过长、target 为空、target 只含注释的样本。
+5. 在样本字段中保留 `language`、`task_type`、`source_dataset`、`prefix`、`suffix`、`target`、`prompt_with_mask`、`raw_meta`，用于后续采样配比、消融和错误分析。
+
+#### 9.4 后续优先级
+
+当前不建议马上构造一个很大的 mixture。更稳妥的路径是：
+
+1. 先下载并抽样 MBPP、APPS、The Stack 的小规模数据。
+2. 为每个 source 写 probe / visualization，确认构造出的样本在形态上确实接近对应 benchmark。
+3. 先构造小规模训练集，例如每个 benchmark family 1k-5k 条，跑一次 sanity training / evaluation。
+4. 如果指标变化方向合理，再扩大到正式训练规模。
+5. 如果 MBPP + APPS 仍无法很好匹配 HumanEval-Infilling 的 docstring 风格，再考虑加入 CodeContests / Project CodeNet 的 Python accepted solution 作为补充。

@@ -5,6 +5,8 @@ import argparse
 import hashlib
 import json
 import re
+import shutil
+import subprocess
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -58,6 +60,21 @@ def rough_token_count(text: str) -> int:
 
 def nonempty_line_count(text: str) -> int:
     return sum(1 for line in text.splitlines() if line.strip())
+
+
+def gofmt_check_full_code(full_code: str, gofmt_bin: str) -> tuple[bool, str]:
+    stripped = full_code.lstrip()
+    wrapped = full_code if stripped.startswith("package ") else "package main\n\n" + full_code
+    proc = subprocess.run(
+        [gofmt_bin],
+        input=wrapped,
+        text=True,
+        capture_output=True,
+    )
+    if proc.returncode == 0:
+        return True, ""
+    stderr = (proc.stderr or "").strip()
+    return False, stderr.splitlines()[0] if stderr else f"{gofmt_bin} failed with exit code {proc.returncode}"
 
 
 def strip_cjk_comments(text: str) -> tuple[str, int]:
@@ -138,6 +155,8 @@ def make_sample(
     max_target_nonempty_lines: int,
     max_target_rough_tokens: int,
     max_target_chars: int,
+    filter_gofmt_valid: bool,
+    gofmt_bin: str,
 ) -> tuple[dict[str, Any] | None, str | None]:
     prompt = str(row.get("prompt") or "")
     target = str(row.get("response") or "")
@@ -165,6 +184,12 @@ def make_sample(
     if max_target_chars > 0 and target_chars > max_target_chars:
         return None, "target_too_many_chars"
 
+    full_code = prefix + target + suffix
+    if filter_gofmt_valid:
+        ok, _ = gofmt_check_full_code(full_code, gofmt_bin)
+        if not ok:
+            return None, "gofmt_invalid_full_code"
+
     uid_seed = "\n".join([task_id, prefix, target, suffix])
     uid = f"huawei_go_{stable_hash(uid_seed)}"
     user = USER_TEMPLATE.format(prefix=prefix, suffix=suffix)
@@ -178,7 +203,7 @@ def make_sample(
         "prefix": prefix,
         "target": target,
         "suffix": suffix,
-        "full_code": prefix + target + suffix,
+        "full_code": full_code,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user},
@@ -199,6 +224,7 @@ def make_sample(
             "target_rough_tokens": target_rough_tokens,
             "strip_cjk_comments": strip_comments,
             "removed_cjk_comments": removed_comments,
+            "filter_gofmt_valid": filter_gofmt_valid,
         },
         "judge_payload": {"kind": "none"},
     }
@@ -238,11 +264,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-target-nonempty-lines", type=int, default=0, help="Reject samples with target non-empty lines above this value; 0 disables.")
     p.add_argument("--max-target-rough-tokens", type=int, default=0, help="Reject samples with target rough token count above this value; 0 disables.")
     p.add_argument("--max-target-chars", type=int, default=0, help="Reject samples with target char count above this value; 0 disables.")
+    p.add_argument("--filter-gofmt-valid", action="store_true", help="Reject samples whose prefix+target+suffix is not parseable by gofmt.")
+    p.add_argument("--gofmt-bin", default="gofmt", help="gofmt executable used by --filter-gofmt-valid.")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.filter_gofmt_valid and shutil.which(args.gofmt_bin) is None:
+        raise SystemExit(f"--filter-gofmt-valid requires gofmt executable, but not found: {args.gofmt_bin}")
+
     rows: list[dict[str, Any]] = []
     rejects: list[dict[str, Any]] = []
     stats: Counter[str] = Counter()
@@ -262,6 +293,8 @@ def main() -> None:
             max_target_nonempty_lines=args.max_target_nonempty_lines,
             max_target_rough_tokens=args.max_target_rough_tokens,
             max_target_chars=args.max_target_chars,
+            filter_gofmt_valid=args.filter_gofmt_valid,
+            gofmt_bin=args.gofmt_bin,
         )
         if sample is None:
             stats["rejected"] += 1
@@ -297,6 +330,8 @@ def main() -> None:
             "max_target_nonempty_lines": args.max_target_nonempty_lines,
             "max_target_rough_tokens": args.max_target_rough_tokens,
             "max_target_chars": args.max_target_chars,
+            "filter_gofmt_valid": args.filter_gofmt_valid,
+            "gofmt_bin": args.gofmt_bin,
         },
         "stats": dict(stats),
         "rejects_preview": rejects[:50],
