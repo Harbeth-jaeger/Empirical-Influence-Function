@@ -266,8 +266,8 @@ def predictions_for(row: dict[str, Any], pred_map: dict[str, list[str]], oracle:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate Go external FIM benchmark predictions with pass@k and CodeBLEU.")
     p.add_argument("--eval-data", type=Path, nargs="+", default=[
-        Path("data/go_single_fim/test_data/mceval/mceval_go_single_v2_canonical.jsonl"),
-        Path("data/go_single_fim/test_data/humaneval_x/humaneval_x_go_derived_canonical.jsonl"),
+        Path("data/go_singleline_fim_exp/test_data/mceval/mceval_go_single_v2_canonical.jsonl"),
+        Path("data/go_singleline_fim_exp/test_data/humaneval_x/humaneval_x_go_derived_canonical.jsonl"),
     ])
     p.add_argument("--predictions", type=Path, help="JSONL with uid + prediction/predictions/raw_generation. Not needed with --oracle.")
     p.add_argument("--oracle", action="store_true", help="Use gold target repeated k times as predictions; validates evaluator plumbing.")

@@ -344,3 +344,7 @@ pip-log.txt
 .ipynb_checkpoints
 
 outputs/
+
+external/
+
+scripts/benchmark/official_evaluators
