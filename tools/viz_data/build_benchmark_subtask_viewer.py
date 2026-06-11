@@ -98,6 +98,57 @@ def build_view_data(test_dir: Path, samples_per_task: int, seed: int) -> list[di
     return groups
 
 
+def make_example(row: dict, file_name: str, task_type: str, index: int) -> dict:
+    prefix = normalize_newlines(row.get("prefix"))
+    suffix = normalize_newlines(row.get("suffix"))
+    target = normalize_newlines(row.get("target"))
+    mask_prefix, mask_suffix = mask_parts_for_target(target)
+    return {
+        "index": index,
+        "uid": row.get("uid"),
+        "official_task_id": row.get("official_task_id") or row.get("uid"),
+        "benchmark": row.get("benchmark"),
+        "language": row.get("language"),
+        "file": file_name,
+        "task_type": task_type,
+        "prefix": prefix,
+        "suffix": suffix,
+        "target": target,
+        "mask_prefix": mask_prefix,
+        "mask_suffix": mask_suffix,
+        "prompt_with_mask": f"{prefix}{mask_prefix}[MASK]{mask_suffix}{suffix}",
+        "filled_code": f"{prefix}{target}{suffix}",
+        "target_lines": line_count(target),
+        "target_chars": len(target),
+    }
+
+
+def build_auto_view_data(test_dir: Path, samples_per_task: int, seed: int, task_types: set[str] | None) -> list[dict]:
+    rng = random.Random(seed)
+    groups = []
+    for path in sorted(test_dir.glob("*.jsonl")):
+        rows = read_jsonl(path)
+        available_types = sorted({str(row.get("task_type") or "unknown") for row in rows})
+        for task_type in available_types:
+            if task_types is not None and task_type not in task_types:
+                continue
+            candidates = [row for row in rows if str(row.get("task_type") or "unknown") == task_type]
+            shuffled = list(candidates)
+            rng.shuffle(shuffled)
+            selected = shuffled[:samples_per_task]
+            examples = [make_example(row, path.name, task_type, idx) for idx, row in enumerate(selected, start=1)]
+            groups.append(
+                {
+                    "file": path.name,
+                    "task_type": task_type,
+                    "num_available": len(candidates),
+                    "num_shown": len(examples),
+                    "examples": examples,
+                }
+            )
+    return groups
+
+
 def render_html(groups: list[dict], title: str) -> str:
     data = json.dumps(groups, ensure_ascii=False)
     return f"""<!doctype html>
@@ -447,9 +498,15 @@ def main() -> None:
     parser.add_argument("--samples-per-task", type=int, default=10)
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--title", default="Python FIM Benchmark Subtask Viewer")
+    parser.add_argument("--auto-groups", action="store_true", help="Group every JSONL in --test-dir by its task_type field.")
+    parser.add_argument("--task-types", nargs="*", default=None, help="Optional task_type allowlist for --auto-groups.")
     args = parser.parse_args()
 
-    groups = build_view_data(args.test_dir, args.samples_per_task, args.seed)
+    if args.auto_groups:
+        task_types = set(args.task_types) if args.task_types else None
+        groups = build_auto_view_data(args.test_dir, args.samples_per_task, args.seed, task_types)
+    else:
+        groups = build_view_data(args.test_dir, args.samples_per_task, args.seed)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(render_html(groups, args.title), encoding="utf-8")
     total = sum(group["num_shown"] for group in groups)

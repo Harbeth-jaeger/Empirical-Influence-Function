@@ -233,11 +233,22 @@ def get_chatml_offsets(messages: list[dict[str, str]]) -> tuple[int, int, str, s
     return user_content_start, assistant_content_start, user_content, assistant_content
 
 
+def find_code_mask_pos(user_content: str) -> int:
+    marker = "* Incomplete Code:\n"
+    marker_pos = user_content.find(marker)
+    if marker_pos >= 0:
+        code_start = marker_pos + len(marker)
+        mask_pos = user_content.find(MASK_TOKEN, code_start)
+        if mask_pos >= 0:
+            return mask_pos
+    return user_content.rfind(MASK_TOKEN)
+
+
 def build_filled_instruction(user_content: str, target: str) -> tuple[str, int, int]:
-    mask_pos = user_content.find(MASK_TOKEN)
+    mask_pos = find_code_mask_pos(user_content)
     if mask_pos < 0:
         raise ValueError("user content does not contain [MASK]")
-    filled = user_content.replace(MASK_TOKEN, target, 1)
+    filled = user_content[:mask_pos] + target + user_content[mask_pos + len(MASK_TOKEN):]
     return filled, mask_pos, mask_pos + len(target)
 
 
@@ -357,6 +368,47 @@ def map_to_qwen_annotations(
                     }
                 )
     return qwen_tokens, qwen_annotations
+
+
+def mask_qwen_token_indices(tokenizer: Any, messages: list[dict[str, str]]) -> set[int]:
+    text = chatml_text(messages)
+    enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+    user_start, _, user_content, _ = get_chatml_offsets(messages)
+    out: set[int] = set()
+    search_from = 0
+    while True:
+        mask_pos = user_content.find(MASK_TOKEN, search_from)
+        if mask_pos < 0:
+            break
+        mask_start = user_start + mask_pos
+        mask_end = mask_start + len(MASK_TOKEN)
+        for idx, (start, end) in enumerate(enc["offset_mapping"]):
+            if int(start) < mask_end and mask_start < int(end):
+                out.add(idx)
+        search_from = mask_pos + len(MASK_TOKEN)
+    return out
+
+
+def drop_mask_token_annotations(
+    qwen_annotations: list[dict[str, Any]],
+    *,
+    tokenizer: Any,
+    messages: list[dict[str, str]],
+) -> list[dict[str, Any]]:
+    mask_indices = mask_qwen_token_indices(tokenizer, messages)
+    if not mask_indices:
+        return qwen_annotations
+    out: list[dict[str, Any]] = []
+    for ann in qwen_annotations:
+        try:
+            src = int(ann["token_i_idx"])
+            dst = int(ann["token_j_idx"])
+        except Exception:
+            continue
+        if src in mask_indices or dst in mask_indices:
+            continue
+        out.append(ann)
+    return out
 
 
 def filter_qwen_annotations_for_fim(
@@ -566,6 +618,11 @@ def dedupe_correlations(correlations: list[TokenCorrelation]) -> list[TokenCorre
     seen: set[tuple[int, int, str]] = set()
     for corr in correlations:
         subtype = corr.subtype if corr.subtype in VALID_REASONS else "semantic"
+        if subtype == "dataflow":
+            src_norm = normalize_token_surface(str(corr.token_i))
+            dst_norm = normalize_token_surface(str(corr.token_j))
+            if src_norm and src_norm == dst_norm and IDENT_RE.match(src_norm):
+                subtype = "defuse"
         key = (int(corr.token_i_idx), int(corr.token_j_idx), subtype)
         if key in seen or key[0] == key[1]:
             continue
@@ -815,6 +872,7 @@ def annotate_row(row: dict[str, Any], tokenizer: Any, max_len: int, max_rounds: 
         completion_indices=set(completion_indices),
     )
     qwen_annotations = filter_qwen_annotations_for_fim(raw_qwen_annotations, packed["label"])
+    qwen_annotations = drop_mask_token_annotations(qwen_annotations, tokenizer=tokenizer, messages=messages)
     attention_edges = qwen_to_attention_edges(qwen_annotations, len(packed["input_ids"]))
     out = {
         "input_ids": packed["input_ids"],

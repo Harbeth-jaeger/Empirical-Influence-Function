@@ -962,7 +962,51 @@ class SyntacticCheckerTool:
             name_node = next((c for c in node.children if c.type in IDENT_TYPES), None)
             return [name_node] if name_node is not None else []
 
+        def collect_python_parameter_nodes(fn_node):
+            params = fn_node.child_by_field_name("parameters")
+            if params is None:
+                params = next((c for c in fn_node.children if c.type == "parameters"), None)
+            if params is None:
+                return []
+            out = []
+
+            def add_name(n):
+                if n is not None and n.type in IDENT_TYPES and code[n.start_byte:n.end_byte] != "_":
+                    out.append(n)
+
+            def walk_param(n):
+                # Python tree-sitter uses wrappers such as typed_parameter, default_parameter,
+                # list_splat_pattern and dictionary_splat_pattern. Prefer their `name` field
+                # so identifiers in default values are not misclassified as declarations.
+                name = n.child_by_field_name("name")
+                if name is not None:
+                    add_name(name)
+                    return
+                if n.type in IDENT_TYPES:
+                    add_name(n)
+                    return
+                if n.type in {"typed_parameter", "default_parameter", "list_splat_pattern", "dictionary_splat_pattern"}:
+                    for c in n.children:
+                        if c.type in IDENT_TYPES:
+                            add_name(c)
+                            return
+                for c in n.children:
+                    if c.type in {",", "(", ")", "*", "**", "/"}:
+                        continue
+                    walk_param(c)
+
+            for child in params.children:
+                walk_param(child)
+            return out
+
         def collect_decls(node):
+            if node.type in {"function_definition", "function_declaration"}:
+                for name_node in collect_python_parameter_nodes(node):
+                    surface = code[name_node.start_byte:name_node.end_byte]
+                    idx = self._resolve(name_node.start_byte, name_node.end_byte,
+                                        code, offset_to_idx, subwords, char_offset)
+                    if idx != -1:
+                        decl_map.setdefault(surface, []).append(idx)
             if node.type in DECL_PARENTS:
                 for name_node in collect_decl_name_nodes(node):
                     surface = code[name_node.start_byte:name_node.end_byte]

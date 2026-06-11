@@ -2105,64 +2105,136 @@ docker run --rm \
 | `scripts/benchmark/official_evaluators/human_eval_infilling/` | 本地下载的 HumanEval-Infilling 官方 evaluator，可由上文命令恢复；默认不建议提交到 git。                             |
 | `scripts/benchmark/official_evaluators/safim/`                | 本地下载的 SAFIM 官方 evaluator，可由上文命令恢复；默认不建议提交到 git。                                           |
 
-### 9. 当前状态
+### 9. train data 准备
 
-当前已经完成并验证：
+本节记录正式 benchmark 阶段对应的训练数据获取与处理思路。下文统一使用简称：
 
 ```text
-HumanEval-Infilling:
+humaneval = HumanEval-Infilling
+safim     = SAFIM
+```
+
+当前 benchmark pipeline 状态：
+
+```text
+humaneval:
   prepare / postprocess / official evaluator 均已跑通。
   oracle pass@1/pass@10 全为 1。
+  正式只测 single_line 和 multi_line，不使用 random_span / random_span_light。
 
-SAFIM:
+safim:
   prepare / postprocess / exact oracle 已跑通。
   official evaluator 依赖 ExecEval Docker，当前因外部依赖下载超时暂缓。
 ```
 
-因此，正式 benchmark pipeline 中 HumanEval-Infilling 部分已经可以作为完整 official evaluation 链路使用；SAFIM 的数据 adapter 已验证，但 official execution backend 仍需单独解决。
+因此，train data 的构造目标不是复用 Go single-line FIM 调试数据，而是分别围绕 `humaneval` 和 `safim` 构造 train-test task match 的 FIM mixture。benchmark test data 本身不改 official id、不改测试协议；训练数据可以从其他高质量代码数据中派生，但派生后的输入输出形式必须贴近目标 benchmark。
 
 #### 9.1 正式 train mixture 的当前决策
 
-Go single-line FIM 数据已经完成了一轮调试和探索，但它不再作为正式 paper benchmark 的主训练设定。正式评测阶段需要围绕两个原生 code completion / code infilling benchmark 构造 train-test task match 的训练混合：
+正式训练数据分成两个 benchmark family：
 
 ```text
-HumanEval-Infilling:
-  train data source: MBPP + APPS
+humaneval train:
+  data source: SelfCodeAlign seed function pool (`bigcode/python-stack-v1-functions-filtered-sc2`)
+  language: Python
+  task ratio: single_line 15%, multi_line 85%
 
-SAFIM:
-  train data source: The Stack
+safim train:
+  data source: The Stack / The Stack v2
+  language: Python, Java, C++, C#
+  task ratio: algorithmic_block 45%, control_flow_expression 45%, api_function_call 10%
 ```
 
-这里的原则是：benchmark 本身不改动，训练数据可以从其他高质量代码数据中派生，但派生后的输入输出形式必须尽量贴近 benchmark 的原生任务形态。
+比例依据：
 
-#### 9.2 HumanEval-Infilling train mixture 要求
+- `humaneval` 正式只测 `single_line` 和 `multi_line`。当前 benchmark 统计中二者比例约为 `15.09% / 84.91%`，因此训练侧按 `15% / 85%` 对齐；`random_span` 和 `random_span_light` 质量不稳定，正式训练 mixture 中先不纳入。
+- `safim` benchmark 中 `algorithmic_block` 和 `control_flow_expression` 占绝大多数，`api_function_call` 尤其在 Java / C++ / C# 中占比很低。训练侧使用 `45% / 45% / 10%`，相当于对 API call 做轻度 oversampling，避免该子任务在训练中被完全淹没；评测时仍按 official benchmark 原始分布和 per-task breakdown 报告。
 
-HumanEval-Infilling 是 Python-only、function-level 的 FIM benchmark。它的样本通常是一个带 docstring 的 Python 函数，docstring 中包含任务描述、约束和示例；mask 位于函数体内部，主要包含 single-line、multi-line、random-span 和 random-span-light 几类场景。
+训练产物建议统一放在：
 
-因此，HumanEval-Infilling 的训练数据不能只从普通裸函数中随机挖空。更合理的训练 mixture 应该具备：
+```text
+data/benchmark/train_data/humaneval/
+data/benchmark/train_data/safim/
+```
 
-1. Python 语言。
-2. function-level 样本。
-3. 函数前部或函数内部包含自然语言任务描述，最好包含 examples / asserts / tests。
-4. mask 覆盖 single-line statement、multi-line block，以及少量 random-span。
-5. 与 HumanEval test problem 不同源，避免 test contamination。
+每条训练链路至少产出三层文件：
 
-当前选择 `MBPP + APPS` 作为最小可行训练源：
+```text
+canonical jsonl:
+  prefix / target / suffix / language / task_type / source_dataset / raw_meta
 
-- `MBPP`：每条样本包含自然语言题目描述、Python reference solution 和测试断言，形态上最接近 HumanEval 的“问题描述 -> 函数实现”。它适合构造带 docstring 的 function-level FIM，尤其适合 single-line 和较短 multi-line mask。
-- `APPS`：包含更复杂的编程题、标准答案和测试，算法结构比 MBPP 更丰富。它适合补充 HumanEval multi-line 场景中常见的循环、条件、状态更新和算法主体代码。
+chatml jsonl:
+  messages / prefix / target / suffix / only_last_turn_loss
 
-后续构造方式建议：
+compact annotated jsonl:
+  input_ids / label / attention_edges / annotation_meta
+```
 
-1. 将 MBPP / APPS 的题目描述、输入输出说明、examples 或 tests 整理为 Python docstring。
-2. 将 reference solution 规范化为可解析 Python code。
-3. 对每个函数构造 `prefix + [MASK] + suffix -> target`。
-4. 按 task type 保留字段，例如 `single_line`、`multi_line`、`random_span`。
-5. 优先保证 single-line 和 multi-line 的质量；random-span 可以先做轻量版本，不必完全复刻 HumanEval 的随机挖空分布。
+其中 canonical 是数据真相层，ChatML 是模型输入层，compact annotated 是 ours causality curation 的训练层。
 
-#### 9.3 SAFIM train mixture 要求
+#### 9.2 humaneval train data 获取与处理
 
-SAFIM 是 syntax-aware FIM benchmark，强调 file-level / script-level 代码补全，并按结构化场景评估：
+`humaneval` 是 Python-only、function-level FIM benchmark。正式评测只关注：
+
+```text
+single_line
+multi_line
+```
+
+当前主训练源改为 SelfCodeAlign 的 documented Python seed function pool：
+
+```text
+bigcode/python-stack-v1-functions-filtered-sc2
+```
+
+选择它的原因是：这份数据已经由 SelfCodeAlign 从 The Stack Python 中抽取 top-level functions with docstrings，并经过 return filtering、import inference、Pyright type checking、benchmark contamination filtering 和 StarCoder2 docstring/code quality filtering。它比从 `MBPP + APPS` 人工拼 docstring 更贴近 `humaneval` 的 documented function 分布，也能避免 APPS 题面过长、风格偏竞赛题的问题。
+
+`MBPP + APPS` 仍可作为 backup / ablation source，但不再作为 humaneval 主训练源。
+
+原始数据建议放在：
+
+```text
+data/raw_data/selfcodealign_python_functions/
+```
+
+派生后的训练数据仍覆盖到统一路径：
+
+```text
+data/benchmark/train_data/humaneval_python_canonical.jsonl
+data/benchmark/train_data/humaneval_python_chatml.jsonl
+data/benchmark/train_data/humaneval_python_build_report.json
+```
+
+构造流程：
+
+1. 下载 `bigcode/python-stack-v1-functions-filtered-sc2` 到本地 raw data 目录。
+2. 读取每条样本的 `content` 字段，作为一个 documented Python function。
+3. 使用 `ast.parse` 验证函数可解析，并保留原始 docstring；不再从 APPS / MBPP 题面重构 docstring。
+4. 对 `content` 做轻量二次去污染：和当前 `humaneval` official test 的 `prefix + target + suffix` 做 normalized full-code exact hash 匹配，命中则丢弃。
+5. 构造 `single_line`：mask 函数体中的一整行有效 statement，优先 assignment、return、API call、条件内部关键更新语句。
+6. 构造 `multi_line`：mask 连续多行 statement 或完整 block，优先循环体、if/else body、try/with body、连续状态更新逻辑。
+7. 验证 `prefix + target + suffix == full_code`，并用 `ast.parse` 检查回填后的 Python 代码仍可解析。
+8. 做长度过滤，避免训练时被 tokenizer 截断；当前默认 `prompt <= 6000 chars`、`full_code <= 8000 chars`。
+9. 按 `single_line 15% / multi_line 85%` 采样，保留 `source_dataset`、`task_type`、`raw_task_id`、`target_line_range` 等字段。
+10. 渲染为与 benchmark prepare 阶段一致的 ChatML `[MASK] -> assistant target` 格式。
+11. 后续调用 `src/annotate` 完成结构边和 LLM 语义补边，再映射为 Qwen BPE compact annotated 格式。
+
+推荐主构造命令：
+
+```bash
+python scripts/data_process/build_humaneval_train_data.py \
+  --source selfcodealign \
+  --out-dir data/benchmark/train_data \
+  --max-source-rows 8000 \
+  --max-samples 10000 \
+  --docstring-mode preserve \
+  --max-prompt-chars 6000 \
+  --max-full-chars 8000
+```
+
+#### 9.3 safim train data 获取与处理
+
+`safim` 是 syntax-aware FIM benchmark，强调 file-level / script-level 代码补全，并按结构化场景评估：
 
 ```text
 algorithmic_block
@@ -2170,37 +2242,50 @@ control_flow_expression
 api_function_call
 ```
 
-因此，SAFIM 的训练数据需要尽量保留完整文件上下文，而不是只保留单个函数片段。它的训练 mixture 应该具备：
+因此，`safim` 训练数据应尽量保留完整文件上下文，而不是只保留单个函数片段。当前选择 `The Stack / The Stack v2` 作为最小可行训练源，原因是它覆盖 Python、Java、C++、C# 多语言文件级代码，和 safim 的多语言 syntax-aware 设置更匹配。
 
-1. 覆盖 Python、Java、C++、C#。
-2. file-level 或接近 file-level 的代码上下文。
-3. mask 位置由语法结构决定，而不是纯随机字符 span。
-4. task type 能区分算法块、控制流条件表达式和 API 调用。
-5. 尽量使用 permissive license 数据，便于论文和后续复现说明。
+原始数据建议放在：
 
-当前选择 `The Stack` 作为最小可行训练源：
+```text
+data/raw_data/the_stack/
+data/raw_data/the_stack_v2/
+```
 
-- `The Stack` 覆盖多语言、文件级代码，包含 Python、Java、C++、C#，和 SAFIM 的多语言 file-level 设置更匹配。
-- 它比 CodeSearchNet 更适合 SAFIM，因为 CodeSearchNet 主要是 function-level docstring-code pair，缺少 C++ / C#，也不天然保留完整文件上下文。
-- 它适合通过 AST / tree-sitter 规则构造 syntax-aware mask，例如隐藏控制流表达式、API call expression、循环体或关键算法块。
+派生后的训练数据建议按语言组织：
 
-后续构造方式建议：
+```text
+data/benchmark/train_data/safim/safim_python_train_canonical.jsonl
+data/benchmark/train_data/safim/safim_java_train_canonical.jsonl
+data/benchmark/train_data/safim/safim_cpp_train_canonical.jsonl
+data/benchmark/train_data/safim/safim_csharp_train_canonical.jsonl
+data/benchmark/train_data/safim/safim_train_chatml.jsonl
+data/benchmark/train_data/safim/safim_train_compact_annotated.jsonl
+data/benchmark/train_data/safim/build_report.json
+```
 
-1. 从 The Stack 中按语言抽取 Python / Java / C++ / C# 文件。
-2. 使用 tree-sitter 或语言 parser 解析文件。
-3. 根据 AST node 类型构造三类 mask：
-   - `algorithmic_block`：循环体、条件分支体、函数内关键 statement block。
-   - `control_flow_expression`：`if` / `elif` / `while` / `for` 中的条件或控制表达式。
-   - `api_function_call`：函数调用表达式、方法调用表达式、库 API 调用。
-4. 过滤不可解析、过短、过长、target 为空、target 只含注释的样本。
-5. 在样本字段中保留 `language`、`task_type`、`source_dataset`、`prefix`、`suffix`、`target`、`prompt_with_mask`、`raw_meta`，用于后续采样配比、消融和错误分析。
+构造流程：
+
+1. 从 The Stack / The Stack v2 中按语言抽取 Python / Java / C++ / C# 文件。
+2. 保留 permissive license、文件长度适中、非 generated、非 minified、非 test fixture 的源码文件。
+3. 使用 tree-sitter 或对应语言 parser 解析完整文件。
+4. 构造 `algorithmic_block`：mask loop body、if/else body、case body、函数内连续 statement block 或核心算法更新块。
+5. 构造 `control_flow_expression`：mask `if` / `elif` / `while` / `for` / `switch` 等控制结构中的 condition、range、update 或 case expression。
+6. 构造 `api_function_call`：mask 完整 call expression / method invocation，保留 import、receiver、变量定义、类型和上下文。
+7. 验证 `prefix + target + suffix == original_code`，并对回填代码做 parse / compile sanity check；Python 可先用 parse，Java / C++ / C# 至少先做 parser 级检查。
+8. 过滤不可解析、target 为空、target 只含注释、target 过短或过长、上下文过长、mask 位置不稳定的样本。
+9. 按 `algorithmic_block 45% / control_flow_expression 45% / api_function_call 10%` 采样，并在每条样本中保留 `language`、`task_type`、`ast_node_type`、`source_dataset`、`repo_or_file_meta`。
+10. 渲染为与 safim prepare 阶段一致的 ChatML `[MASK] -> assistant target` 格式。
+11. 调用 `src/annotate` 完成结构边和 LLM 语义补边，再映射为 Qwen BPE compact annotated 格式。
+
+采样时需要同时控制语言分布和 task type 分布。建议第一版不要强行按 safim test 的语言样本数比例训练，因为 C++ 样本在 test 中占比很高，容易让训练 mixture 过度偏向 C++。更稳妥的做法是先按语言均衡或轻度接近 test 分布采样，再在每种语言内部执行 `45% / 45% / 10%` 的 task ratio。
 
 #### 9.4 后续优先级
 
-当前不建议马上构造一个很大的 mixture。更稳妥的路径是：
+当前不建议马上构造很大的 train mixture。更稳妥的交接路径是：
 
-1. 先下载并抽样 MBPP、APPS、The Stack 的小规模数据。
-2. 为每个 source 写 probe / visualization，确认构造出的样本在形态上确实接近对应 benchmark。
-3. 先构造小规模训练集，例如每个 benchmark family 1k-5k 条，跑一次 sanity training / evaluation。
-4. 如果指标变化方向合理，再扩大到正式训练规模。
-5. 如果 MBPP + APPS 仍无法很好匹配 HumanEval-Infilling 的 docstring 风格，再考虑加入 CodeContests / Project CodeNet 的 Python accepted solution 作为补充。
+1. 先为 `humaneval` 构造 MBPP + APPS 小规模 mixture，例如 1k-5k 条，确认 `15% / 85%` 比例、ChatML render、annotation 和 compact 格式都自洽。
+2. 使用已有 humaneval official evaluator 跑一次 base / CE / ours 的小规模闭环，因为这一条 evaluation 链路目前最完整。
+3. 再为 `safim` 构造 The Stack 小规模 multilingual mixture，每种语言先各取少量样本，重点检查 AST mask 是否真的贴近 `algorithmic_block / control_flow_expression / api_function_call`。
+4. 对 train data 构建轻量 viewer 或抽样报告，人工检查 `prefix + [MASK] + suffix`、`target`、`task_type`、annotation edge 是否合理。
+5. 小规模训练和评测方向正确后，再扩大正式训练规模；扩大前需要固定 random seed、source split、dedup 规则和 build report。
+6. 如果 `humaneval` 的 multi-line 质量不足，再考虑加入 CodeContests / Project CodeNet 的 Python accepted solution 作为补充；如果 `safim` 的 algorithmic block 不足，再考虑专门从 CodeContests 补充算法块样本。
