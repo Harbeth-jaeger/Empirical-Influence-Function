@@ -300,7 +300,7 @@ _NAME_TOKEN_NODE_TYPES = {
     "type_identifier",
 }
 
-_SKIP_LEAF_TEXT = {"", ",", ";", "(", ")", "{", "}", "[", "]"}
+_SKIP_LEAF_TEXT = {"", ",", ";", ".", "(", ")", "{", "}", "[", "]"}
 
 
 @dataclass
@@ -385,7 +385,19 @@ class SyntacticCheckerTool:
         offset_to_idx = self._build_offset_map(subwords)
         edges: list[StructuralEdge] = []
         self._walk(root, parse_code, offset_to_idx, subwords, edges, parse_char_offset)
-        return edges
+        return self._dedupe_edges(edges)
+
+    @staticmethod
+    def _dedupe_edges(edges: list[StructuralEdge]) -> list[StructuralEdge]:
+        out: list[StructuralEdge] = []
+        seen: set[tuple[int, int, str]] = set()
+        for edge in edges:
+            key = (int(edge.token_i_idx), int(edge.token_j_idx), str(edge.reason))
+            if key in seen or key[0] == key[1]:
+                continue
+            seen.add(key)
+            out.append(edge)
+        return out
 
     # ── Build offset → token index map ───────────────────────────────────────
 
@@ -426,6 +438,7 @@ class SyntacticCheckerTool:
         # Global passes (single traversal over the whole tree)
         self._bracket_edges(root, code, offset_to_idx, subwords, edges, char_offset)
         self._defuse_edges(root, code, offset_to_idx, subwords, edges, char_offset)
+        self._go_qualified_type_edges(root, code, offset_to_idx, subwords, edges, char_offset)
         # Per-node passes (visit each node once)
         self._walk_structural(root, code, offset_to_idx, subwords, edges, char_offset)
 
@@ -560,6 +573,86 @@ class SyntacticCheckerTool:
         for src in self._leaf_token_indices(base_node, code, offset_to_idx, subwords, char_offset):
             if src != dst:
                 edges.append(StructuralEdge(src, dst, "api"))
+
+    def _qualified_type_name_node(self, node):
+        name = node.child_by_field_name("name")
+        if name is not None:
+            return name
+        for child in reversed(node.children):
+            if child.type in {"type_identifier", "identifier", "package_identifier"}:
+                return child
+        return None
+
+    def _qualified_type_internal_edges(self, node, code, offset_to_idx, subwords, edges, char_offset=0):
+        """Go type selector: package token predicts selected type name in pkg.Type."""
+        if node.type != "qualified_type":
+            return
+        name_node = self._qualified_type_name_node(node)
+        if name_node is None:
+            return
+        dst = self._resolve(name_node.start_byte, name_node.end_byte, code, offset_to_idx, subwords, char_offset)
+        if dst == -1:
+            return
+        package = node.child_by_field_name("package")
+        package_nodes = [package] if package is not None else []
+        if not package_nodes:
+            package_nodes = [
+                c for c in node.children
+                if c.type in {"package_identifier", "identifier"} and c is not name_node
+            ]
+        for package_node in package_nodes:
+            src = self._resolve(package_node.start_byte, package_node.end_byte, code, offset_to_idx, subwords, char_offset)
+            if src != -1 and src != dst:
+                edges.append(StructuralEdge(src, dst, "api"))
+
+    def _go_qualified_type_edges(self, root, code, offset_to_idx, subwords, edges, char_offset=0):
+        """Cover Go qualified types in type positions, e.g. chan *pkg.Type or []pkg.Type.
+
+        tree-sitter-go parses these as `qualified_type`, not `selector_expression`,
+        so the normal selector pass does not see them.  Emit both the direct
+        package -> type selector edge and type -> declared-name edges.
+        """
+
+        def declared_name_nodes(node):
+            if node.type == "parameter_declaration":
+                out = []
+                for child in node.children:
+                    if child.type in {"identifier", "field_identifier", "simple_identifier", "variable_name"}:
+                        out.append(child)
+                    else:
+                        break
+                return out
+            if node.type in {"var_spec", "const_spec", "field_declaration"}:
+                name = node.child_by_field_name("name")
+                if name is not None:
+                    return [name]
+                return [
+                    c for c in node.children
+                    if c.type in {"identifier", "field_identifier", "simple_identifier", "variable_name"}
+                ][:1]
+            return []
+
+        def walk(node):
+            if node.type == "qualified_type":
+                self._qualified_type_internal_edges(node, code, offset_to_idx, subwords, edges, char_offset)
+
+            type_node = node.child_by_field_name("type")
+            if type_node is not None:
+                names = declared_name_nodes(node)
+                if names:
+                    type_indices = self._type_leaf_indices(type_node, code, offset_to_idx, subwords, char_offset)
+                    for name in names:
+                        dst = self._resolve(name.start_byte, name.end_byte, code, offset_to_idx, subwords, char_offset)
+                        if dst == -1:
+                            continue
+                        for src in type_indices:
+                            if src != dst:
+                                edges.append(StructuralEdge(src, dst, "type"))
+
+            for child in node.children:
+                walk(child)
+
+        walk(root)
 
     def _callee_token_indices(self, callee_node, code, offset_to_idx, subwords, char_offset=0) -> list[int]:
         if callee_node is None:

@@ -29,11 +29,11 @@ export GOFMT_BIN=/path/to/gofmt
 
 ## 部署标注
 
-本节是华为机器现场优先执行的命令。路径、数据、tokenizer/base model、外部标注模型都以这里为准；下面同时设置 `TRAIN_DATA` 和 `HUAWEI_RAW_DATA`，避免脚本回退到本地默认路径。
+本节是华为机器现场优先执行的命令。路径、数据、tokenizer/base model、外部标注模型都以这里为准。多份训练 jsonl 用命令行位置参数传给 `scripts/huawei_deploy/annotate.sh`，脚本会按顺序串行处理，并为每份数据按文件名自动派生 prepared/cache/compact 输出名。
 
-注意：不要把真实 `HW_APPKEY / OPENAI_API_KEY / ANNOTATE_MODEL / HW_OPERATOR` 固化提交到仓库文档。真实值从华为机器本地 `EIF-huawei-annotation/常用命令.md` 复制，或者整理到一个不提交 git 的本地 env 文件后 `source`。
+注意：真实 `HW_APPKEY / OPENAI_API_KEY / ANNOTATE_MODEL / HW_OPERATOR` 等值来自华为机器本地 `EIF-huawei-annotation/常用命令.md`。如果后续要公开仓库或同步给无权限环境，需要先脱敏。
 
-关于调用模型进行在线推理、辅助标注，华为官方提供了部署在他们机器上的模型，具体调用详见`scripts/huawei_deploy/vlm.py` 。
+关于调用模型进行在线推理、辅助标注，华为官方提供了部署在他们机器上的模型，具体调用详见 `scripts/huawei_deploy/vlm.py`。
 
 ### 0. 进入仓库和环境
 
@@ -41,26 +41,39 @@ export GOFMT_BIN=/path/to/gofmt
 cd /home/model_project/EIF-huawei-annotation
 source .venv/bin/activate
 conda activate EIF
+
+mkdir -p data/huawei_data/processed_30_clean
+mkdir -p data/huawei_data/processed_full_clean
+mkdir -p outputs/huawei_deploy
+mkdir -p runs/huawei_deploy
 ```
 
-### 1. 公共路径、API 和模型变量
+### 1. 公共环境变量
 
 ```bash
-export TRAIN_DATA=/home/model_project/Open_CC_SFT_Eval/train/cloud_core_test_25.JunJunly_GoOnly_length_filter.jsonl
-export HUAWEI_RAW_DATA="$TRAIN_DATA"
+# 数据路径：第 1 份是真实已确认路径，其余 3 份明天在华为机器上替换为实际 jsonl。
+export TRAIN_DATA_1=/home/model_project/Open_CC_SFT_Eval/train/cloud_core_test_25.JunJunly_GoOnly_length_filter.jsonl
+export TRAIN_DATA_2=<第二份华为训练数据.jsonl>
+export TRAIN_DATA_3=<第三份华为训练数据.jsonl>
+export TRAIN_DATA_4=<第四份华为训练数据.jsonl>
+
+# tokenizer / base model 路径
 export MODEL_PATH=/home/model_project/CCCodeGenerationTrain/infer_format/
 
+# 华为 OpenAI-compatible API
 export REQUIRE_HUAWEI_GATEWAY=1
 export OPENAI_BASE_URL=https://apigw-cn-south02.huawei.com/api/v1
 export OPENAI_API_KEY="com.huawei.ipd.coretool.coreai"
 export ANNOTATE_MODEL="6d2c5ff6-615d-45a8-9703-2f591d6c2437"
 
+# 华为网关身份信息
 export HW_ID=com.huawei.ipd.coretool.coreai
 export HW_APPKEY="WxhsDOVQJGVYpkDfQ7C2HA=="
 export HW_APP_ID=com.huawei.ipd.coretool.coreai
 export HW_SCENE=test
 export HW_OPERATOR="h00965148"
 
+# HTTP / SSL / 生成参数
 export ANNOTATE_HTTP_PROXY_NONE=1
 export ANNOTATE_VERIFY_SSL=0
 export HW_ENABLE_THINKING=0
@@ -70,7 +83,10 @@ export ANNOTATE_MAX_RETRIES=8
 export ANNOTATE_RETRY_BASE_SLEEP=10
 export ANNOTATE_MAX_TOKENS=2048
 
+# 标注模式
 export ANNOTATION_MODE=agent
+
+# 数据清洗与质量过滤
 export STRIP_CJK_COMMENTS=1
 export MAX_TARGET_NONEMPTY_LINES=10
 export MAX_TARGET_ROUGH_TOKENS=192
@@ -79,28 +95,16 @@ export FILTER_GOFMT_VALID=1
 export GOFMT_BIN=gofmt
 ```
 
-### 2. 先跑 30 条检查并生成 HTML
+### 2. 小样本检查
 
-先创建目录。注意：`nohup > runs/...log` 的重定向发生在脚本启动前，所以 `runs/huawei_deploy` 必须提前存在。
-
-```bash
-mkdir -p data/huawei_data/processed_30_clean
-mkdir -p outputs/huawei_deploy
-mkdir -p runs/huawei_deploy
-```
-
-配置 30 条检查路径：
+默认先用第 1 份数据跑 30 条，检查转换、过滤、标注和 HTML 可视化是否正常。这样总量就是 30 条，不会因为传入 4 份数据变成每份各 30 条。
 
 ```bash
 export HUAWEI_PROCESSED_DIR=data/huawei_data/processed_30_clean
-export HUAWEI_CHATML_DATA=data/huawei_data/processed_30_clean/huawei_go_30_clean_chatml.jsonl
-export HUAWEI_CANONICAL_DATA=data/huawei_data/processed_30_clean/huawei_go_30_clean_canonical.jsonl
-export HUAWEI_PREPARE_REPORT=data/huawei_data/processed_30_clean/huawei_go_30_clean_prepare_report.json
-
 export OUT_DIR=data/huawei_data/processed_30_clean
 export RUN_DIR=runs/huawei_deploy
 export VIS_OUT_DIR=outputs/huawei_deploy
-export CHECK_RUN_NAME=huawei_go_30_clean_check
+
 export CHECK_ROWS=30
 export VALIDATE_LIMIT=100
 export PREPARE_MAX_ACCEPTED_ROWS=30
@@ -112,7 +116,10 @@ export ENABLE_VISUALIZE=1
 
 ```bash
 export NUM_WORKERS=12
-nohup bash scripts/huawei_deploy/annotate.sh check   > runs/huawei_deploy/huawei_go_30_clean_check_w12.pipeline.log 2>&1 &
+export ANNOTATE_MIN_REQUEST_INTERVAL=1.0
+
+nohup bash scripts/huawei_deploy/annotate.sh check "$TRAIN_DATA_1" \
+  > runs/huawei_deploy/huawei_go_30_clean_check_w12.pipeline.log 2>&1 &
 ```
 
 查看日志：
@@ -125,7 +132,10 @@ tail -f runs/huawei_deploy/huawei_go_30_clean_check_w12.pipeline.log
 
 ```bash
 export NUM_WORKERS=8
-nohup bash scripts/huawei_deploy/annotate.sh check   > runs/huawei_deploy/huawei_go_30_clean_check_w8.pipeline.log 2>&1 &
+export ANNOTATE_MIN_REQUEST_INTERVAL=1.0
+
+nohup bash scripts/huawei_deploy/annotate.sh check "$TRAIN_DATA_1" \
+  > runs/huawei_deploy/huawei_go_30_clean_check_w8.pipeline.log 2>&1 &
 ```
 
 如果 8 workers 仍触发 429，改成 4 并增加间隔：
@@ -133,16 +143,16 @@ nohup bash scripts/huawei_deploy/annotate.sh check   > runs/huawei_deploy/huawei
 ```bash
 export NUM_WORKERS=4
 export ANNOTATE_MIN_REQUEST_INTERVAL=2.0
-nohup bash scripts/huawei_deploy/annotate.sh check   > runs/huawei_deploy/huawei_go_30_clean_check_w4.pipeline.log 2>&1 &
+
+nohup bash scripts/huawei_deploy/annotate.sh check "$TRAIN_DATA_1" \
+  > runs/huawei_deploy/huawei_go_30_clean_check_w4.pipeline.log 2>&1 &
 ```
 
 检查输出：
 
 ```bash
-wc -l data/huawei_data/processed_30_clean/huawei_go_30_clean_chatml.jsonl
-wc -l data/huawei_data/processed_30_clean/huawei_go_30_clean_canonical.jsonl
-wc -l data/huawei_data/processed_30_clean/huawei_go_30_clean_check_compact.jsonl
-ls -lh outputs/huawei_deploy/huawei_go_30_clean_check_viewer.html
+ls -lh data/huawei_data/processed_30_clean
+ls -lh outputs/huawei_deploy
 ```
 
 打开 HTML：
@@ -157,36 +167,44 @@ python -m http.server 8000
 http://<server>:8000/outputs/huawei_deploy/huawei_go_30_clean_check_viewer.html
 ```
 
-### 3. 30 条检查没问题后跑 5000 条
-
-先创建目录：
+如果想确认 4 份数据都能被顺序处理，可以在小样本阶段也传入 4 个路径。注意：此时是每份数据最多 accepted 30 条，合计最多约 120 条。
 
 ```bash
-mkdir -p data/huawei_data/processed_5k_clean
-mkdir -p runs/huawei_deploy
+nohup bash scripts/huawei_deploy/annotate.sh check \
+  "$TRAIN_DATA_1" \
+  "$TRAIN_DATA_2" \
+  "$TRAIN_DATA_3" \
+  "$TRAIN_DATA_4" \
+  > runs/huawei_deploy/huawei_go_4files_30_check.pipeline.log 2>&1 &
 ```
 
-配置 5K 路径。这里用 `full` 模式，但 prepare 阶段只收满 5000 条 accepted 样本，所以不是全量 raw。
+### 3. 全量标注
+
+30 条检查没问题后，跑 4 份训练数据的全量标注。这里使用命令行位置参数传入 4 个 jsonl，脚本会串行处理：第 1 份完成后自动处理第 2 份，然后第 3、4 份。
 
 ```bash
-export HUAWEI_PROCESSED_DIR=data/huawei_data/processed_5k_clean
-export HUAWEI_CHATML_DATA=data/huawei_data/processed_5k_clean/huawei_go_5k_clean_chatml.jsonl
-export HUAWEI_CANONICAL_DATA=data/huawei_data/processed_5k_clean/huawei_go_5k_clean_canonical.jsonl
-export HUAWEI_PREPARE_REPORT=data/huawei_data/processed_5k_clean/huawei_go_5k_clean_prepare_report.json
-
-export OUT_DIR=data/huawei_data/processed_5k_clean
+export HUAWEI_PROCESSED_DIR=data/huawei_data/processed_full_clean
+export OUT_DIR=data/huawei_data/processed_full_clean
 export RUN_DIR=runs/huawei_deploy
-export FULL_RUN_NAME=huawei_go_5k_clean
-export PREPARE_MAX_ACCEPTED_ROWS=5000
+export VIS_OUT_DIR=outputs/huawei_deploy
+
+export PREPARE_MAX_ACCEPTED_ROWS=0
 export FORCE_PREPARE=1
+export ENABLE_VISUALIZE=0
 ```
 
-沿用 30 条检查中最快且不 429 的并发。例如 8 稳定：
+沿用小样本检查中最快且不 429 的并发。例如 8 稳定：
 
 ```bash
 export NUM_WORKERS=8
 export ANNOTATE_MIN_REQUEST_INTERVAL=1.0
-nohup bash scripts/huawei_deploy/annotate.sh full   > runs/huawei_deploy/huawei_go_5k_clean.pipeline.log 2>&1 &
+
+nohup bash scripts/huawei_deploy/annotate.sh full \
+  "$TRAIN_DATA_1" \
+  "$TRAIN_DATA_2" \
+  "$TRAIN_DATA_3" \
+  "$TRAIN_DATA_4" \
+  > runs/huawei_deploy/huawei_go_4files_full.pipeline.log 2>&1 &
 ```
 
 如果 8 不稳，使用保守配置：
@@ -194,25 +212,30 @@ nohup bash scripts/huawei_deploy/annotate.sh full   > runs/huawei_deploy/huawei_
 ```bash
 export NUM_WORKERS=4
 export ANNOTATE_MIN_REQUEST_INTERVAL=2.0
-nohup bash scripts/huawei_deploy/annotate.sh full   > runs/huawei_deploy/huawei_go_5k_clean.pipeline.log 2>&1 &
+
+nohup bash scripts/huawei_deploy/annotate.sh full \
+  "$TRAIN_DATA_1" \
+  "$TRAIN_DATA_2" \
+  "$TRAIN_DATA_3" \
+  "$TRAIN_DATA_4" \
+  > runs/huawei_deploy/huawei_go_4files_full.pipeline.log 2>&1 &
 ```
 
 监控进度：
 
 ```bash
-tail -f runs/huawei_deploy/huawei_go_5k_clean.pipeline.log
-wc -l runs/huawei_deploy/huawei_go_5k_clean.annotation_cache.jsonl
-wc -l data/huawei_data/processed_5k_clean/huawei_go_5k_clean_compact.jsonl
+tail -f runs/huawei_deploy/huawei_go_4files_full.pipeline.log
+ls -lh data/huawei_data/processed_full_clean
+ls -lh runs/huawei_deploy
 ```
 
-5K 输出：
+全量输出会按每个 raw 文件的 basename 自动派生。例如输入文件名是 `cloud_core_test_25.JunJunly_GoOnly_length_filter.jsonl`，主要输出类似：
 
 ```text
-data/huawei_data/processed_5k_clean/huawei_go_5k_clean_chatml.jsonl
-data/huawei_data/processed_5k_clean/huawei_go_5k_clean_canonical.jsonl
-data/huawei_data/processed_5k_clean/huawei_go_5k_clean_compact.jsonl
-runs/huawei_deploy/huawei_go_5k_clean.annotation_cache.jsonl
-runs/huawei_deploy/huawei_go_5k_clean.pipeline.log
+data/huawei_data/processed_full_clean/cloud_core_test_25.JunJunly_GoOnly_length_filter_chatml.jsonl
+data/huawei_data/processed_full_clean/cloud_core_test_25.JunJunly_GoOnly_length_filter_canonical.jsonl
+data/huawei_data/processed_full_clean/cloud_core_test_25.JunJunly_GoOnly_length_filter_full_huawei_agent_compact.jsonl
+runs/huawei_deploy/cloud_core_test_25.JunJunly_GoOnly_length_filter_full_huawei_agent.annotation_cache.jsonl
 ```
 
 ## 部署训练

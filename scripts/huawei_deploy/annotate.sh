@@ -2,8 +2,38 @@
 set -euo pipefail
 
 MODE="${1:-check}"
+if [[ $# -gt 0 ]]; then
+  shift
+fi
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
+
+run_batch_if_requested() {
+  local raw_files=()
+  if [[ $# -gt 0 ]]; then
+    raw_files=("$@")
+  elif [[ -n "${HUAWEI_RAW_DATA_LIST:-}" ]]; then
+    # Whitespace-separated list. Keep paths space-free on deployment machines.
+    # For paths that contain spaces, pass them as positional args instead.
+    read -r -a raw_files <<< "$HUAWEI_RAW_DATA_LIST"
+  fi
+
+  if [[ "${#raw_files[@]}" -eq 0 ]]; then
+    return 1
+  fi
+
+  local idx=0
+  for raw in "${raw_files[@]}"; do
+    idx=$((idx + 1))
+    printf '[huawei-annotate] batch %d/%d raw=%s\n' "$idx" "${#raw_files[@]}" "$raw"
+    HUAWEI_RAW_DATA="$raw"     HUAWEI_RAW_DATA_LIST=""     HUAWEI_CHATML_DATA=""     HUAWEI_CANONICAL_DATA=""     HUAWEI_PREPARE_REPORT=""     CHECK_RUN_NAME=""     FULL_RUN_NAME=""     VIS_RUN_NAME=""     OUTPUT_PATH=""     CACHE_PATH=""       bash "$0" "$MODE"
+  done
+  return 0
+}
+
+if run_batch_if_requested "$@"; then
+  exit 0
+fi
 
 RAW_DATA="${HUAWEI_RAW_DATA:-${RAW_DATA:-${TRAIN_DATA:-data/huawei_data/cloud_core_test_25.JunJunly_GoOnly_length_filter.jsonl}}}"
 PROCESSED_DIR="${HUAWEI_PROCESSED_DIR:-data/huawei_data/processed}"
@@ -34,7 +64,7 @@ VIS_OUT_DIR="${VIS_OUT_DIR:-outputs/huawei_deploy}"
 
 usage() {
   cat <<'EOF'
-Usage: bash scripts/huawei_deploy/annotate.sh [prepare|validate|check|full|visualize|all]
+Usage: bash scripts/huawei_deploy/annotate.sh [prepare|validate|check|full|visualize|all] [raw1.jsonl raw2.jsonl ...]
 
 Modes:
   prepare    Convert Huawei raw prompt/response/task_id JSONL to project ChatML/FIM JSONL.
@@ -44,8 +74,14 @@ Modes:
   visualize  Build rich-sample CSV and HTML viewer for CHECK_RUN_NAME output.
   all        prepare -> validate -> check -> optional visualize -> full annotation.
 
+Batch input:
+  Pass multiple raw JSONL paths after MODE, or set HUAWEI_RAW_DATA_LIST="a.jsonl b.jsonl".
+  The script runs the selected MODE sequentially for each file and auto-derives
+  per-file chatml/canonical/report/cache/output names from each raw basename.
+
 Important env vars:
   HUAWEI_RAW_DATA       Raw Huawei JSONL path. Fallbacks: RAW_DATA, TRAIN_DATA, then local default.
+  HUAWEI_RAW_DATA_LIST  Optional whitespace-separated raw JSONL list for sequential batch runs.
   HUAWEI_CHATML_DATA    Converted ChatML output path.
   HUAWEI_CANONICAL_DATA Converted canonical output path.
   FORCE_PREPARE=1      Rebuild converted data even if outputs already exist.

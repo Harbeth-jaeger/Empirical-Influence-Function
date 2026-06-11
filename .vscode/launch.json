@@ -65,6 +65,56 @@
                 "TOKENIZERS_PARALLELISM": "false",
                 "PYTHONPATH": "${workspaceFolder}"
             }
+        },
+        {
+            "name": "debug annotate one row",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/go_singleline_fim_exp/annotate_chatml_with_src_annotate.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.micromamba/envs/eif-bench/bin/python",
+            "justMyCode": false,
+            "args": [
+                "--input_path",
+                "data/go_singleline_fim_exp/train_data/go_single_train_v2_chatml.jsonl",
+                "--output_path",
+                "outputs/debug_annotate/debug_one_row.jsonl",
+                "--model_name_or_path",
+                "models/Qwen2.5-Coder-7B-Instruct",
+                "--model_max_length",
+                "4096",
+                "--max_rows",
+                "1",
+                "--num_workers",
+                "1",
+                "--max_rounds",
+                "1",
+                "--annotation_mode",
+                "oneshot",
+                "--max_teacher_edges",
+                "16",
+                "--annotation_cache_path",
+                "outputs/debug_annotate/debug_one_row.annotation_cache.jsonl",
+                "--flush_every",
+                "1",
+                "--overwrite_cache"
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "",
+                "HF_HUB_OFFLINE": "1",
+                "TRANSFORMERS_OFFLINE": "1",
+                "TOKENIZERS_PARALLELISM": "false",
+                "PYTHONPATH": "${workspaceFolder}",
+                "OPENAI_API_KEY": "${env:OPENAI_API_KEY}",
+                "OPENAI_BASE_URL": "${env:OPENAI_BASE_URL}",
+                "ANNOTATE_MODEL": "${env:ANNOTATE_MODEL}",
+                "ANNOTATE_MAX_TOKENS": "1024",
+                "ANNOTATE_MIN_REQUEST_INTERVAL": "1.2",
+                "ANNOTATE_MAX_RETRIES": "1",
+                "ANNOTATE_RETRY_BASE_SLEEP": "3",
+                "ANNOTATE_REQUEST_TIMEOUT": "60"
+            }
         }
     ]
 }

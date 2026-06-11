@@ -159,12 +159,21 @@ def make_sample(
     gofmt_bin: str,
 ) -> tuple[dict[str, Any] | None, str | None]:
     prompt = str(row.get("prompt") or "")
-    target = str(row.get("response") or "")
-    task_id = str(row.get("task_id") or f"row_{index}")
+    target = str(row.get("target", row.get("response", "")) or "")
+    task_id = str(row.get("task_id") or row.get("raw_id") or row.get("uid") or f"row_{index}")
+    source_format = "prompt_response_task_id_with_PRE_SUF_MID"
     parts = extract_fim_parts(prompt)
-    if parts is None or not target:
+    if parts is None:
+        if "prefix" in row and "suffix" in row and target:
+            prefix = str(row.get("prefix") or "")
+            suffix = str(row.get("suffix") or "")
+            source_format = "canonical_or_chatml_prefix_target_suffix"
+        else:
+            return None, "missing_markers_or_target"
+    elif target:
+        prefix, suffix = parts
+    else:
         return None, "missing_markers_or_target"
-    prefix, suffix = parts
 
     removed_comments = {"prefix": 0, "target": 0, "suffix": 0}
     if strip_comments:
@@ -195,8 +204,8 @@ def make_sample(
     user = USER_TEMPLATE.format(prefix=prefix, suffix=suffix)
     sample: dict[str, Any] = {
         "uid": uid,
-        "raw_id": task_id,
-        "source_dataset": "huawei_cloud_core_go",
+        "raw_id": str(row.get("raw_id") or task_id),
+        "source_dataset": str(row.get("source_dataset") or "huawei_cloud_core_go"),
         "split": "train",
         "language": "go",
         "task_type": "go_fim_completion_huawei_derived",
@@ -213,7 +222,7 @@ def make_sample(
         "metadata": {
             "raw_task_id": task_id,
             "source_benchmark": "Huawei cloud_core Go",
-            "source_format": "prompt_response_task_id_with_PRE_SUF_MID",
+            "source_format": source_format,
             "package_path": extract_package_path(prompt),
             "raw_prompt_sha1": hashlib.sha1(prompt.encode("utf-8", errors="ignore")).hexdigest(),
             "raw_index": index,

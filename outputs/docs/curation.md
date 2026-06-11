@@ -1575,7 +1575,6 @@ S = P\_{\\text{model}}(\\text{Correct} \\mid \\text{Input, Output})
 
 ## 十、正式评测阶段所用数据的获取及处理
 
-
 这一章记录正式 paper 阶段使用的外部 FIM benchmark。与第三章的 Go single-line 调试场景不同，正式评测阶段不再把 HumanEval-X / MultiPL-E 这类 text-to-code benchmark 转成 derived FIM 作为主表，而是优先选择原生或近原生的 code infilling / FIM benchmark。
 
 正式评测 pipeline 的目标是：
@@ -1593,10 +1592,11 @@ official benchmark raw data
 
 正式主评测暂定使用两个 benchmark family。
 
-| Benchmark | 选择原因 | 语言 | 子任务 / 场景 | 主要指标 |
-| --- | --- | --- | --- | --- |
-| HumanEval-Infilling | 经典 HumanEval FIM 派生 benchmark，输入天然是 `prefix + suffix -> missing code`，可用 unit tests 计算 pass@k。 | Python | `single_line`、`multi_line`、`random_span`、`random_span_light` | pass@1 / pass@k |
-| SAFIM | Syntax-Aware FIM benchmark，专门评估结构化 infilling，包括算法块、控制流表达式和 API 调用。 | Python / Java / C++ / C# | `algorithmic_block`、`control_flow_expression`、`api_function_call` | official pass@1；当前先用 exact sanity 检查 adapter |
+
+| Benchmark           | 选择原因                                                                                                      | 语言                     | 子任务 / 场景                                                       | 主要指标                                            |
+| ------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------ | ------------------------------------------------------------------- | --------------------------------------------------- |
+| HumanEval-Infilling | 经典 HumanEval FIM 派生 benchmark，输入天然是`prefix + suffix -> missing code`，可用 unit tests 计算 pass@k。 | Python                   | `single_line`、`multi_line`、`random_span`、`random_span_light`     | pass@1 / pass@k                                     |
+| SAFIM               | Syntax-Aware FIM benchmark，专门评估结构化 infilling，包括算法块、控制流表达式和 API 调用。                   | Python / Java / C++ / C# | `algorithmic_block`、`control_flow_expression`、`api_function_call` | official pass@1；当前先用 exact sanity 检查 adapter |
 
 选择原则：
 
@@ -1667,12 +1667,13 @@ data/benchmark/test_data/build_report.json
 
 相关构造与分析脚本：
 
-| 文件 | 作用 |
-| --- | --- |
-| `scripts/data_process/download_official_fim_benchmarks.py` | 下载 HumanEval-Infilling 和 SAFIM 官方 raw data。 |
-| `scripts/data_process/build_official_fim_benchmark_test_data.py` | 从 raw data 构造统一 benchmark test jsonl。 |
-| `scripts/data_process/analyze_official_fim_benchmark_data.py` | 统计各 benchmark / language / task type 的数量、比例、mask/target 长度分布。 |
-| `tools/viz_data/` | 轻量可视化 benchmark 样本，按子任务查看 `prefix + [MASK] + suffix` 和 `target`。 |
+
+| 文件                                                             | 作用                                                                            |
+| ---------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `scripts/data_process/download_official_fim_benchmarks.py`       | 下载 HumanEval-Infilling 和 SAFIM 官方 raw data。                               |
+| `scripts/data_process/build_official_fim_benchmark_test_data.py` | 从 raw data 构造统一 benchmark test jsonl。                                     |
+| `scripts/data_process/analyze_official_fim_benchmark_data.py`    | 统计各 benchmark / language / task type 的数量、比例、mask/target 长度分布。    |
+| `tools/viz_data/`                                                | 轻量可视化 benchmark 样本，按子任务查看`prefix + [MASK] + suffix` 和 `target`。 |
 
 ### 3. Prepare Data：模型输入准备
 
@@ -2090,18 +2091,19 @@ docker run --rm \
 
 当前遗留问题是：ExecEval 官方 Dockerfile 是全语言执行环境，包含 Go、Kotlin、PyPy、Node、Rust、Ruby、PHP、libseccomp 等大量下载项；在当前机器网络环境下已经出现 Oracle JDK 和 Go 下载超时。因此 SAFIM official evaluator 暂缓，短期只使用 `eval-exact` 验证 adapter 自洽。
 
-### 8. 当前代码文件作用汇总
+### 8. 代码文件作用汇总
 
-| 文件 | 作用 |
-| --- | --- |
-| `scripts/benchmark/benchmark_official_common.py` | 公共工具：JSONL 读写、task type 映射、ChatML render、prediction 清洗、prediction map 加载。 |
-| `scripts/benchmark/evaluate_humaneval_infilling.py` | HumanEval-Infilling wrapper：`prepare`、`make-oracle`、`postprocess`、`eval`、`eval-subset`。 |
-| `scripts/benchmark/evaluate_safim.py` | SAFIM wrapper：`prepare`、`make-oracle`、`postprocess`、`eval-exact`、`run-official`。 |
-| `scripts/benchmark/generate_official_fim_predictions.py` | 通用 HF 基模推理入口，读取 `*_infer_requests.jsonl`，输出 predictions jsonl。 |
-| `scripts/benchmark/run_humaneval_infilling_eval.sh` | HumanEval-Infilling 全流程 shell：prepare(auto) -> generate -> postprocess -> evaluate。 |
-| `scripts/benchmark/run_safim_eval.sh` | SAFIM 全流程 shell：prepare(auto) -> generate -> postprocess -> eval-exact；可选 `RUN_OFFICIAL=1` 跑官方 evaluator。 |
-| `scripts/benchmark/official_evaluators/human_eval_infilling/` | 本地下载的 HumanEval-Infilling 官方 evaluator，可由上文命令恢复；默认不建议提交到 git。 |
-| `scripts/benchmark/official_evaluators/safim/` | 本地下载的 SAFIM 官方 evaluator，可由上文命令恢复；默认不建议提交到 git。 |
+
+| 文件                                                          | 作用                                                                                                                |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `scripts/benchmark/benchmark_official_common.py`              | 公共工具：JSONL 读写、task type 映射、ChatML render、prediction 清洗、prediction map 加载。                         |
+| `scripts/benchmark/evaluate_humaneval_infilling.py`           | HumanEval-Infilling wrapper：`prepare`、`make-oracle`、`postprocess`、`eval`、`eval-subset`。                       |
+| `scripts/benchmark/evaluate_safim.py`                         | SAFIM wrapper：`prepare`、`make-oracle`、`postprocess`、`eval-exact`、`run-official`。                              |
+| `scripts/benchmark/generate_official_fim_predictions.py`      | 通用 HF 基模推理入口，读取`*_infer_requests.jsonl`，输出 predictions jsonl。                                        |
+| `scripts/benchmark/run_humaneval_infilling_eval.sh`           | HumanEval-Infilling 全流程 shell：prepare(auto) -> generate -> postprocess -> evaluate。                            |
+| `scripts/benchmark/run_safim_eval.sh`                         | SAFIM 全流程 shell：prepare(auto) -> generate -> postprocess -> eval-exact；可选`RUN_OFFICIAL=1` 跑官方 evaluator。 |
+| `scripts/benchmark/official_evaluators/human_eval_infilling/` | 本地下载的 HumanEval-Infilling 官方 evaluator，可由上文命令恢复；默认不建议提交到 git。                             |
+| `scripts/benchmark/official_evaluators/safim/`                | 本地下载的 SAFIM 官方 evaluator，可由上文命令恢复；默认不建议提交到 git。                                           |
 
 ### 9. 当前状态
 
