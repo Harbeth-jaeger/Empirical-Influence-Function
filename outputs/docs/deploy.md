@@ -54,7 +54,7 @@ mkdir -p runs/huawei_deploy
 ### 1. 公共环境变量
 
 ```bash
-# 数据路径：第 1 份是真实已确认路径，其余 3 份明天在华为机器上替换为实际 jsonl。
+# 数据路径：注意最后一个文件是java文件。
 export TRAIN_DATA_1=/home/model_project/Open_CC_SFT_Eval/train/cloud_core_test_25.JunJunly_GoOnly_length_filter.jsonl
 export TRAIN_DATA_2=/home/model_project/Open_CC_SFT_Eval/train/cloud_core_test_25.JunJunly_GoGoLLTTrain.jsonl
 export TRAIN_DATA_3=/home/model_project/Open_CC_SFT_Eval/train/cloud_core_test_25.JunJunly_GoOnly.jsonl
@@ -63,13 +63,13 @@ export TRAIN_DATA_4=/home/model_project/Open_CC_SFT_Eval/train/cloud_core_test_2
 # tokenizer / base model 路径
 export MODEL_PATH=/home/model_project/CCCodeGenerationTrain/infer_format/
 
-# 华为 OpenAI-compatible API
+# 华为 OpenAI-compatible API（此处可能是错误信息，详见EIF-huawei-annotation/scripts/huawei_deploy/new_llm.py）
 export REQUIRE_HUAWEI_GATEWAY=1
 export OPENAI_BASE_URL=https://apigw-cn-south02.huawei.com/api/v1
 export OPENAI_API_KEY="com.huawei.ipd.coretool.coreai"
 export ANNOTATE_MODEL="6d2c5ff6-615d-45a8-9703-2f591d6c2437"
 
-# 华为网关身份信息
+# 华为网关身份信息（此处可能是错误信息，详见EIF-huawei-annotation/scripts/huawei_deploy/new_llm.py）
 export HW_ID=com.huawei.ipd.coretool.coreai
 export HW_APPKEY="WxhsDOVQJGVYpkDfQ7C2HA=="
 export HW_APP_ID=com.huawei.ipd.coretool.coreai
