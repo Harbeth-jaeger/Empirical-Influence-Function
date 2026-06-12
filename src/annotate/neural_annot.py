@@ -215,6 +215,22 @@ def _rate_limited_chat_completion(client: OpenAI, **kwargs):
         merged_body.update(kwargs.get("extra_body") or {})
         kwargs["extra_body"] = merged_body
 
+    huawei_template_mode = _env_flag("ANNOTATE_HUAWEI_TEMPLATE_MODE") or _env_flag("REQUIRE_HUAWEI_GATEWAY", True)
+    if huawei_template_mode:
+        # Huawei's reference template puts sampling params in extra_body and uses
+        # streaming.  Some deployments return 500 for OpenAI-standard top-level
+        # fields such as response_format/max_tokens/temperature.
+        body = dict(kwargs.get("extra_body") or {})
+        if "temperature" in kwargs:
+            body.setdefault("temperature", kwargs.pop("temperature"))
+        elif request_temperature is not None:
+            body.setdefault("temperature", float(request_temperature))
+        kwargs["extra_body"] = body
+        if not _env_flag("ANNOTATE_KEEP_RESPONSE_FORMAT"):
+            kwargs.pop("response_format", None)
+        if not _env_flag("ANNOTATE_KEEP_MAX_TOKENS"):
+            kwargs.pop("max_tokens", None)
+
     if _env_flag("ANNOTATE_STREAM") and "stream" not in kwargs and not kwargs.get("tools"):
         kwargs["stream"] = True
 
