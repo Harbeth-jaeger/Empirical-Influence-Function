@@ -169,6 +169,27 @@ def _chat_response_finish_reason(response: Any) -> str:
     return str(getattr(first, "finish_reason", "") or "")
 
 
+def _chat_stream_text(response: Any) -> str:
+    parts: list[str] = []
+    for chunk in response:
+        choices = getattr(chunk, "choices", None)
+        if not choices and isinstance(chunk, dict):
+            choices = chunk.get("choices")
+        if not choices:
+            continue
+        first = choices[0]
+        delta = first.get("delta") if isinstance(first, dict) else getattr(first, "delta", None)
+        if delta is None:
+            continue
+        if isinstance(delta, dict):
+            content = delta.get("content", "")
+        else:
+            content = getattr(delta, "content", "")
+        if content:
+            parts.append(str(content))
+    return "".join(parts)
+
+
 def _rate_limited_chat_completion(client: OpenAI, **kwargs):
     global _OPENAI_LAST_REQUEST_TS
     min_interval = float(os.environ.get("ANNOTATE_MIN_REQUEST_INTERVAL", "1.2"))
@@ -193,6 +214,9 @@ def _rate_limited_chat_completion(client: OpenAI, **kwargs):
         merged_body.update(kwargs.get("extra_body") or {})
         kwargs["extra_body"] = merged_body
 
+    if _env_flag("ANNOTATE_STREAM") and "stream" not in kwargs and not kwargs.get("tools"):
+        kwargs["stream"] = True
+
     for attempt in range(max_retries + 1):
         with _OPENAI_RATE_LOCK:
             now = time.monotonic()
@@ -201,7 +225,10 @@ def _rate_limited_chat_completion(client: OpenAI, **kwargs):
                 time.sleep(wait)
             _OPENAI_LAST_REQUEST_TS = time.monotonic()
         try:
-            return client.chat.completions.create(**kwargs)
+            response = client.chat.completions.create(**kwargs)
+            if kwargs.get("stream"):
+                return _chat_stream_text(response)
+            return response
         except Exception as exc:
             if attempt >= max_retries or not _is_rate_limit_error(exc):
                 raise
@@ -1505,7 +1532,14 @@ class AnnotatorAgent:
                 )
             except Exception as exc:
                 text = str(exc).lower()
-                if "tool choice" in text or "tool_call" in text or "tools" in text:
+                should_fallback = (
+                    "tool choice" in text
+                    or "tool_call" in text
+                    or "tools" in text
+                    or _env_flag("ANNOTATE_FALLBACK_ON_CHAT_ERROR")
+                    or _env_flag("ANNOTATE_STREAM")
+                )
+                if should_fallback:
                     return self._annotate_without_tools(
                         code,
                         subwords,

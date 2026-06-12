@@ -172,11 +172,13 @@ require_api_env() {
 configure_api_env() {
   local require_huawei="${REQUIRE_HUAWEI_GATEWAY:-1}"
   if [[ "$require_huawei" == "1" ]]; then
-    export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://apigw-cn-southe2.huawei.com/api/v1}"
+    export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://apigw-cn-south02.huawei.com/api/v1}"
     export HW_ID="${HW_ID:-com.huawei.ipd.coretool.coreai}"
     export HW_APP_ID="${HW_APP_ID:-$HW_ID}"
     export HW_SCENE="${HW_SCENE:-test}"
     export HW_ENABLE_THINKING="${HW_ENABLE_THINKING:-0}"
+    export ANNOTATE_STREAM="${ANNOTATE_STREAM:-1}"
+    export ANNOTATE_FALLBACK_ON_CHAT_ERROR="${ANNOTATE_FALLBACK_ON_CHAT_ERROR:-1}"
     export ANNOTATE_HTTP_PROXY_NONE="${ANNOTATE_HTTP_PROXY_NONE:-1}"
     export ANNOTATE_VERIFY_SSL="${ANNOTATE_VERIFY_SSL:-0}"
   else
@@ -184,6 +186,8 @@ configure_api_env() {
     unset HUAWEI_HW_ID HUAWEI_HW_APPKEY HUAWEI_APP_ID HUAWEI_SCENE HUAWEI_OPERATOR
     unset ANNOTATE_EXTRA_HEADERS_JSON ANNOTATE_EXTRA_BODY_JSON
     export HW_ENABLE_THINKING="${HW_ENABLE_THINKING:-0}"
+    export ANNOTATE_STREAM="${ANNOTATE_STREAM:-0}"
+    export ANNOTATE_FALLBACK_ON_CHAT_ERROR="${ANNOTATE_FALLBACK_ON_CHAT_ERROR:-0}"
     export ANNOTATE_HTTP_PROXY_NONE="${ANNOTATE_HTTP_PROXY_NONE:-0}"
     export ANNOTATE_VERIFY_SSL="${ANNOTATE_VERIFY_SSL:-1}"
   fi
@@ -221,6 +225,8 @@ run_annotation() {
   echo "model_path=$MODEL_PATH"
   echo "annotate_model=$ANNOTATE_MODEL"
   echo "require_huawei_gateway=${REQUIRE_HUAWEI_GATEWAY:-1}"
+  echo "annotate_stream=${ANNOTATE_STREAM:-0}"
+  echo "fallback_on_chat_error=${ANNOTATE_FALLBACK_ON_CHAT_ERROR:-0}"
   echo "workers=${NUM_WORKERS:-4}"
 
   python scripts/go_singleline_fim_exp/annotate_chatml_with_src_annotate.py     --input_path "$CHATML_DATA"     --output_path "$output_path"     --model_name_or_path "$MODEL_PATH"     "${max_rows_args[@]}"     --num_workers "${NUM_WORKERS:-4}"     --annotation_mode "$ANNOTATION_MODE"     --max_rounds "${MAX_ROUNDS:-6}"     --annotation_cache_path "$cache_path"     --flush_every "${FLUSH_EVERY:-20}"     "${overwrite_args[@]}"

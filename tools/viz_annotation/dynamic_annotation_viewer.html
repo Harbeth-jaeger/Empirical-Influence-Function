@@ -334,7 +334,7 @@
     function tokenHtml(sample) {
       return sample.tokens.map(t => {
         const cls = t.is_completion ? 'tok completion' : 'tok';
-        const label = t.text === '' ? ' ' : t.text;
+        const label = (t.visual_text ?? t.text) === '' ? ' ' : (t.visual_text ?? t.text);
         return `<span class="${cls}" data-idx="${t.idx}" data-label="${esc(label)}">${esc(label)}</span>`;
       }).join('');
     }

@@ -81,6 +81,30 @@ def compact_token_text(text: str) -> str:
     return ""
 
 
+def add_visual_mask_newlines(tokens: list[dict[str, Any]]) -> None:
+    """Make code [MASK] visually occupy the hidden line it represents.
+
+    The actual prompt stores the suffix immediately after [MASK] when the hidden
+    span contains the newline.  For inspection, show a line break after the code
+    mask if the next token is indentation-only whitespace.  This changes only
+    the HTML display, not token ids or annotation indices.
+    """
+    for i, tok in enumerate(tokens):
+        if "ASK" not in str(tok.get("text", "")):
+            continue
+        close = None
+        for j in range(i, min(i + 4, len(tokens))):
+            if "]" in str(tokens[j].get("text", "")):
+                close = j
+                break
+        if close is None or close + 1 >= len(tokens):
+            continue
+        next_text = str(tokens[close + 1].get("text", ""))
+        if next_text and next_text.strip() == "" and "\n" not in next_text:
+            tokens[close]["visual_text"] = str(tokens[close].get("text", "")) + "\n"
+            tokens[close]["visual_display"] = compact_token_text(tokens[close]["visual_text"])
+
+
 def read_jsonl_rows(path: Path, indices: list[int]) -> dict[int, dict[str, Any]]:
     wanted = set(indices)
     rows: dict[int, dict[str, Any]] = {}
@@ -354,6 +378,7 @@ def build_sample_payload(
         }
         for i in range(len(input_ids))
     ]
+    add_visual_mask_newlines(tokens)
     edges = normalize_edges({"attention_edges": row.get("attention_edges") or []}, len(input_ids))
 
     if attention_topk:
