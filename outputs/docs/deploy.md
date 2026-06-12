@@ -42,6 +42,9 @@ cd /home/model_project/EIF-huawei-annotation
 source .venv/bin/activate
 conda activate EIF
 
+export GOROOT="$PWD/.local/go"
+export PATH="$GOROOT/bin:$PATH"
+
 mkdir -p data/huawei_data/processed_30_clean
 mkdir -p data/huawei_data/processed_full_clean
 mkdir -p outputs/huawei_deploy
@@ -53,9 +56,9 @@ mkdir -p runs/huawei_deploy
 ```bash
 # 数据路径：第 1 份是真实已确认路径，其余 3 份明天在华为机器上替换为实际 jsonl。
 export TRAIN_DATA_1=/home/model_project/Open_CC_SFT_Eval/train/cloud_core_test_25.JunJunly_GoOnly_length_filter.jsonl
-export TRAIN_DATA_2=<第二份华为训练数据.jsonl>
-export TRAIN_DATA_3=<第三份华为训练数据.jsonl>
-export TRAIN_DATA_4=<第四份华为训练数据.jsonl>
+export TRAIN_DATA_2=/home/model_project/Open_CC_SFT_Eval/train/cloud_core_test_25.JunJunly_GoGoLLTTrain.jsonl
+export TRAIN_DATA_3=/home/model_project/Open_CC_SFT_Eval/train/cloud_core_test_25.JunJunly_GoOnly.jsonl
+export TRAIN_DATA_4=/home/model_project/Open_CC_SFT_Eval/train/cloud_core_test_25.JunJunly_JavaOnlyTrain.jsonl
 
 # tokenizer / base model 路径
 export MODEL_PATH=/home/model_project/CCCodeGenerationTrain/infer_format/
@@ -92,7 +95,7 @@ export MAX_TARGET_NONEMPTY_LINES=10
 export MAX_TARGET_ROUGH_TOKENS=192
 export MAX_TARGET_CHARS=1024
 export FILTER_GOFMT_VALID=1
-export GOFMT_BIN=gofmt
+export GOFMT_BIN="$GOROOT/bin/gofmt"
 ```
 
 ### 2. 小样本检查
