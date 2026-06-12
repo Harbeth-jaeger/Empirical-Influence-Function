@@ -198,36 +198,69 @@ export FORCE_PREPARE=1
 export ENABLE_VISUALIZE=0
 ```
 
-沿用小样本检查中最快且不 429 的并发。例如 8 稳定：
+全量阶段优先使用 `oneshot` 提速。timeout 或其他失败样本会进入 `*.failures.json`，不会写入最终 `*_compact.jsonl`，后续训练只使用 compact/由 compact 过滤出的数据即可。
+
+推荐先用 12 workers：
 
 ```bash
-export NUM_WORKERS=8
-export ANNOTATE_MIN_REQUEST_INTERVAL=1.0
+export ANNOTATION_MODE=oneshot
+export MAX_ROUNDS=1
+
+export NUM_WORKERS=12
+export ANNOTATE_MIN_REQUEST_INTERVAL=0.2
+export ANNOTATE_REQUEST_TIMEOUT=180
+export ANNOTATE_MAX_RETRIES=3
+export ANNOTATE_RETRY_BASE_SLEEP=10
 
 nohup bash scripts/huawei_deploy/annotate.sh full \
   "$TRAIN_DATA_1" \
   "$TRAIN_DATA_2" \
   "$TRAIN_DATA_3" \
-  > runs/huawei_deploy/huawei_go_3files_full.pipeline.log 2>&1 &
+  > runs/huawei_deploy/huawei_go_3files_full_oneshot_w12.pipeline.log 2>&1 &
 ```
 
-如果 8 不稳，使用保守配置：
+如果 12 workers 稳定且没有明显 429/500，可以尝试 16 workers：
 
 ```bash
-export NUM_WORKERS=4
-export ANNOTATE_MIN_REQUEST_INTERVAL=2.0
+export ANNOTATION_MODE=oneshot
+export MAX_ROUNDS=1
+
+export NUM_WORKERS=16
+export ANNOTATE_MIN_REQUEST_INTERVAL=0.2
+export ANNOTATE_REQUEST_TIMEOUT=180
+export ANNOTATE_MAX_RETRIES=3
+export ANNOTATE_RETRY_BASE_SLEEP=10
 
 nohup bash scripts/huawei_deploy/annotate.sh full \
   "$TRAIN_DATA_1" \
   "$TRAIN_DATA_2" \
   "$TRAIN_DATA_3" \
-  > runs/huawei_deploy/huawei_go_3files_full.pipeline.log 2>&1 &
+  > runs/huawei_deploy/huawei_go_3files_full_oneshot_w16.pipeline.log 2>&1 &
+```
+
+如果 12 workers 不稳，降到 8 workers：
+
+```bash
+export ANNOTATION_MODE=oneshot
+export MAX_ROUNDS=1
+
+export NUM_WORKERS=8
+export ANNOTATE_MIN_REQUEST_INTERVAL=0.5
+export ANNOTATE_REQUEST_TIMEOUT=180
+export ANNOTATE_MAX_RETRIES=3
+export ANNOTATE_RETRY_BASE_SLEEP=10
+
+nohup bash scripts/huawei_deploy/annotate.sh full \
+  "$TRAIN_DATA_1" \
+  "$TRAIN_DATA_2" \
+  "$TRAIN_DATA_3" \
+  > runs/huawei_deploy/huawei_go_3files_full_oneshot_w8.pipeline.log 2>&1 &
 ```
 
 监控进度：
 
 ```bash
-tail -f runs/huawei_deploy/huawei_go_3files_full.pipeline.log
+tail -f runs/huawei_deploy/huawei_go_3files_full_oneshot_w12.pipeline.log
 ls -lh data/huawei_data/processed_full_clean
 ls -lh runs/huawei_deploy
 ```
