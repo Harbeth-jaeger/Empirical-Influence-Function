@@ -8,6 +8,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from types import SimpleNamespace
 
 _key_file = Path("./data/openai_key.txt")
 if not os.environ.get("OPENAI_API_KEY") and _key_file.exists():
@@ -227,7 +228,15 @@ def _rate_limited_chat_completion(client: OpenAI, **kwargs):
         try:
             response = client.chat.completions.create(**kwargs)
             if kwargs.get("stream"):
-                return _chat_stream_text(response)
+                content = _chat_stream_text(response)
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(content=content),
+                            finish_reason="stop",
+                        )
+                    ]
+                )
             return response
         except Exception as exc:
             if attempt >= max_retries or not _is_rate_limit_error(exc):
