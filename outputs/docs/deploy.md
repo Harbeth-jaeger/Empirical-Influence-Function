@@ -33,7 +33,7 @@ export GOFMT_BIN=/path/to/gofmt
 
 注意：真实 `HW_APPKEY / OPENAI_API_KEY / ANNOTATE_MODEL / HW_OPERATOR` 等值来自华为机器本地 `EIF-huawei-annotation/常用命令.md`。如果后续要公开仓库或同步给无权限环境，需要先脱敏。
 
-关于调用模型进行在线推理、辅助标注，华为官方提供了部署在他们机器上的模型，具体调用详见 `scripts/huawei_deploy/vlm.py`。
+关于调用模型进行在线推理、辅助标注，华为官方提供了部署在他们机器上的模型。旧资源模板见 `scripts/huawei_deploy/vlm.py`，当前新资源调用模板见 `scripts/huawei_deploy/new_vlm.py`。
 
 ### 0. 进入仓库和环境
 
@@ -63,13 +63,13 @@ export TRAIN_DATA_4=/home/model_project/Open_CC_SFT_Eval/train/cloud_core_test_2
 # tokenizer / base model 路径
 export MODEL_PATH=/home/model_project/CCCodeGenerationTrain/infer_format/
 
-# 华为 OpenAI-compatible API（此处可能是错误信息，详见EIF-huawei-annotation/scripts/huawei_deploy/new_llm.py）
+# 华为 OpenAI-compatible API（新资源信息来自 scripts/huawei_deploy/new_vlm.py）
 export REQUIRE_HUAWEI_GATEWAY=1
 export OPENAI_BASE_URL=https://apigw-cn-south02.huawei.com/api/v1
 export OPENAI_API_KEY="com.huawei.ipd.coretool.coreai"
-export ANNOTATE_MODEL="6d2c5ff6-615d-45a8-9703-2f591d6c2437"
+export ANNOTATE_MODEL="fa6c020a-06e3-4a4f-8840-2951e5ef934d"
 
-# 华为网关身份信息（此处可能是错误信息，详见EIF-huawei-annotation/scripts/huawei_deploy/new_llm.py）
+# 华为网关身份信息（新资源信息来自 scripts/huawei_deploy/new_vlm.py）
 export HW_ID=com.huawei.ipd.coretool.coreai
 export HW_APPKEY="WxhsDOVQJGVYpkDfQ7C2HA=="
 export HW_APP_ID=com.huawei.ipd.coretool.coreai
@@ -81,6 +81,7 @@ export ANNOTATE_HTTP_PROXY_NONE=1
 export ANNOTATE_VERIFY_SSL=0
 export HW_ENABLE_THINKING=0
 export ANNOTATE_HUAWEI_TEMPLATE_MODE=1
+export ANNOTATE_HUAWEI_CONTENT_LIST=1
 export ANNOTATE_STREAM=1
 export ANNOTATE_FALLBACK_ON_CHAT_ERROR=1
 export ANNOTATE_TEMPERATURE=0.2
@@ -103,7 +104,7 @@ export GOFMT_BIN="$GOROOT/bin/gofmt"
 
 ### 2. 小样本检查
 
-默认先用第 1 份数据跑 30 条，检查转换、过滤、标注和 HTML 可视化是否正常。这样总量就是 30 条，不会因为传入 4 份数据变成每份各 30 条。
+默认先用 3 份 Go 数据做小样本检查，每份 accepted 10 条，合计最多 30 条，用来检查转换、过滤、标注和 HTML 可视化是否正常。`TRAIN_DATA_4` 是 Java 数据，不进入当前 Go 标注链路。
 
 ```bash
 export HUAWEI_PROCESSED_DIR=data/huawei_data/processed_30_clean
@@ -111,9 +112,9 @@ export OUT_DIR=data/huawei_data/processed_30_clean
 export RUN_DIR=runs/huawei_deploy
 export VIS_OUT_DIR=outputs/huawei_deploy
 
-export CHECK_ROWS=30
+export CHECK_ROWS=10
 export VALIDATE_LIMIT=100
-export PREPARE_MAX_ACCEPTED_ROWS=30
+export PREPARE_MAX_ACCEPTED_ROWS=10
 export FORCE_PREPARE=1
 export ENABLE_VISUALIZE=1
 ```
@@ -124,14 +125,17 @@ export ENABLE_VISUALIZE=1
 export NUM_WORKERS=12
 export ANNOTATE_MIN_REQUEST_INTERVAL=1.0
 
-nohup bash scripts/huawei_deploy/annotate.sh check "$TRAIN_DATA_1" \
-  > runs/huawei_deploy/huawei_go_30_clean_check_w12.pipeline.log 2>&1 &
+nohup bash scripts/huawei_deploy/annotate.sh check \
+  "$TRAIN_DATA_1" \
+  "$TRAIN_DATA_2" \
+  "$TRAIN_DATA_3" \
+  > runs/huawei_deploy/huawei_go_3files_10each_check_w12.pipeline.log 2>&1 &
 ```
 
 查看日志：
 
 ```bash
-tail -f runs/huawei_deploy/huawei_go_30_clean_check_w12.pipeline.log
+tail -f runs/huawei_deploy/huawei_go_3files_10each_check_w12.pipeline.log
 ```
 
 如果 12 workers 触发 429，改成 8 重新跑：
@@ -140,8 +144,11 @@ tail -f runs/huawei_deploy/huawei_go_30_clean_check_w12.pipeline.log
 export NUM_WORKERS=8
 export ANNOTATE_MIN_REQUEST_INTERVAL=1.0
 
-nohup bash scripts/huawei_deploy/annotate.sh check "$TRAIN_DATA_1" \
-  > runs/huawei_deploy/huawei_go_30_clean_check_w8.pipeline.log 2>&1 &
+nohup bash scripts/huawei_deploy/annotate.sh check \
+  "$TRAIN_DATA_1" \
+  "$TRAIN_DATA_2" \
+  "$TRAIN_DATA_3" \
+  > runs/huawei_deploy/huawei_go_3files_10each_check_w8.pipeline.log 2>&1 &
 ```
 
 如果 8 workers 仍触发 429，改成 4 并增加间隔：
@@ -150,8 +157,11 @@ nohup bash scripts/huawei_deploy/annotate.sh check "$TRAIN_DATA_1" \
 export NUM_WORKERS=4
 export ANNOTATE_MIN_REQUEST_INTERVAL=2.0
 
-nohup bash scripts/huawei_deploy/annotate.sh check "$TRAIN_DATA_1" \
-  > runs/huawei_deploy/huawei_go_30_clean_check_w4.pipeline.log 2>&1 &
+nohup bash scripts/huawei_deploy/annotate.sh check \
+  "$TRAIN_DATA_1" \
+  "$TRAIN_DATA_2" \
+  "$TRAIN_DATA_3" \
+  > runs/huawei_deploy/huawei_go_3files_10each_check_w4.pipeline.log 2>&1 &
 ```
 
 检查输出：
@@ -173,20 +183,9 @@ python -m http.server 8000
 http://<server>:8000/outputs/huawei_deploy/huawei_go_30_clean_check_viewer.html
 ```
 
-如果想确认 4 份数据都能被顺序处理，可以在小样本阶段也传入 4 个路径。注意：此时是每份数据最多 accepted 30 条，合计最多约 120 条。
-
-```bash
-nohup bash scripts/huawei_deploy/annotate.sh check \
-  "$TRAIN_DATA_1" \
-  "$TRAIN_DATA_2" \
-  "$TRAIN_DATA_3" \
-  "$TRAIN_DATA_4" \
-  > runs/huawei_deploy/huawei_go_4files_30_check.pipeline.log 2>&1 &
-```
-
 ### 3. 全量标注
 
-30 条检查没问题后，跑 4 份训练数据的全量标注。这里使用命令行位置参数传入 4 个 jsonl，脚本会串行处理：第 1 份完成后自动处理第 2 份，然后第 3、4 份。
+30 条检查没问题后，跑 3 份 Go 训练数据的全量标注。这里使用命令行位置参数传入 3 个 jsonl，脚本会串行处理：第 1 份完成后自动处理第 2 份，然后第 3 份。`TRAIN_DATA_4` 是 Java 数据，当前不跑。
 
 ```bash
 export HUAWEI_PROCESSED_DIR=data/huawei_data/processed_full_clean
@@ -209,8 +208,7 @@ nohup bash scripts/huawei_deploy/annotate.sh full \
   "$TRAIN_DATA_1" \
   "$TRAIN_DATA_2" \
   "$TRAIN_DATA_3" \
-  "$TRAIN_DATA_4" \
-  > runs/huawei_deploy/huawei_go_4files_full.pipeline.log 2>&1 &
+  > runs/huawei_deploy/huawei_go_3files_full.pipeline.log 2>&1 &
 ```
 
 如果 8 不稳，使用保守配置：
@@ -223,14 +221,13 @@ nohup bash scripts/huawei_deploy/annotate.sh full \
   "$TRAIN_DATA_1" \
   "$TRAIN_DATA_2" \
   "$TRAIN_DATA_3" \
-  "$TRAIN_DATA_4" \
-  > runs/huawei_deploy/huawei_go_4files_full.pipeline.log 2>&1 &
+  > runs/huawei_deploy/huawei_go_3files_full.pipeline.log 2>&1 &
 ```
 
 监控进度：
 
 ```bash
-tail -f runs/huawei_deploy/huawei_go_4files_full.pipeline.log
+tail -f runs/huawei_deploy/huawei_go_3files_full.pipeline.log
 ls -lh data/huawei_data/processed_full_clean
 ls -lh runs/huawei_deploy
 ```

@@ -191,6 +191,24 @@ def _chat_stream_text(response: Any) -> str:
     return "".join(parts)
 
 
+def _huawei_text_content_messages(messages: Any) -> Any:
+    if not isinstance(messages, list):
+        return messages
+    converted: list[Any] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            converted.append(msg)
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            new_msg = dict(msg)
+            new_msg["content"] = [{"type": "text", "text": content}]
+            converted.append(new_msg)
+        else:
+            converted.append(msg)
+    return converted
+
+
 def _rate_limited_chat_completion(client: OpenAI, **kwargs):
     global _OPENAI_LAST_REQUEST_TS
     min_interval = float(os.environ.get("ANNOTATE_MIN_REQUEST_INTERVAL", "1.2"))
@@ -217,9 +235,10 @@ def _rate_limited_chat_completion(client: OpenAI, **kwargs):
 
     huawei_template_mode = _env_flag("ANNOTATE_HUAWEI_TEMPLATE_MODE") or _env_flag("REQUIRE_HUAWEI_GATEWAY", True)
     if huawei_template_mode:
-        # Huawei's reference template puts sampling params in extra_body and uses
-        # streaming.  Some deployments return 500 for OpenAI-standard top-level
-        # fields such as response_format/max_tokens/temperature.
+        # Huawei's reference template puts sampling params in extra_body, uses
+        # streaming, and represents text messages as multimodal content items.
+        # Some deployments return 500 for OpenAI-standard top-level fields such
+        # as response_format/max_tokens/temperature.
         body = dict(kwargs.get("extra_body") or {})
         if "temperature" in kwargs:
             body.setdefault("temperature", kwargs.pop("temperature"))
@@ -230,6 +249,8 @@ def _rate_limited_chat_completion(client: OpenAI, **kwargs):
             kwargs.pop("response_format", None)
         if not _env_flag("ANNOTATE_KEEP_MAX_TOKENS"):
             kwargs.pop("max_tokens", None)
+        if _env_flag("ANNOTATE_HUAWEI_CONTENT_LIST", True):
+            kwargs["messages"] = _huawei_text_content_messages(kwargs.get("messages"))
 
     if _env_flag("ANNOTATE_STREAM") and "stream" not in kwargs and not kwargs.get("tools"):
         kwargs["stream"] = True
