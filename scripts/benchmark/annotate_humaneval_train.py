@@ -56,11 +56,18 @@ def _token_indices_for_span(qwen_tokens: list[dict[str, Any]], start: int, end: 
 
 def _word_items(text: str, base_offset: int, *, max_items: int = 160) -> list[dict[str, Any]]:
     items = []
+    quote_pairs = {'"': '"', "'": "'", '“': '”', '‘': '’'}
     for match in WORD_RE.finditer(text):
         surface = match.group(0)
+        start = base_offset + match.start()
+        end = base_offset + match.end()
+        if len(surface) >= 2 and surface[0] in quote_pairs and surface[-1] == quote_pairs[surface[0]]:
+            surface = surface[1:-1]
+            start += 1
+            end -= 1
         if len(surface) <= 1 and not surface.isdigit():
             continue
-        items.append({"idx": len(items), "text": surface, "start": base_offset + match.start(), "end": base_offset + match.end()})
+        items.append({"idx": len(items), "text": surface, "start": start, "end": end})
         if len(items) >= max_items:
             break
     return items
@@ -112,7 +119,14 @@ def _extract_doc_and_code_items(row: dict[str, Any]) -> tuple[list[dict[str, Any
 
     doc_items: list[dict[str, Any]] = []
     for start, end in doc_spans:
-        doc_items.extend(_word_items(text[start:end], start, max_items=80 - len(doc_items)))
+        span_text = text[start:end]
+        span_items = _word_items(span_text, start, max_items=80 - len(doc_items))
+        for item in span_items:
+            prefix = span_text[: max(0, int(item["start"]) - start)].lower()
+            last_returns = max(prefix.rfind("returns:"), prefix.rfind("return:"), prefix.rfind(":return"))
+            last_args = max(prefix.rfind("args:"), prefix.rfind("arguments:"), prefix.rfind(":param"), prefix.rfind("params:"))
+            item["doc_section"] = "returns" if last_returns >= 0 and last_returns > last_args else "other"
+        doc_items.extend(span_items)
         if len(doc_items) >= 80:
             break
 
@@ -179,38 +193,44 @@ def _candidate_docstring_pairs(
     *,
     max_edges: int,
 ) -> list[dict[str, Any]]:
-    """Deterministic high-precision backup for docstring->code edges.
+    """High-precision docstring return-answer edges.
 
-    LLMs often miss return literal links such as docstring `Low` -> completion
-    `'Low'`, yet those edges are exactly what makes infilling possible.  Keep
-    this narrow: exact normalized matches only, with completion literals first.
+    Only connect candidate answers in the docstring return description to the
+    same answer appearing in the hidden completion, and only when that answer is
+    absent from non-docstring prompt code.  Args/parameter descriptions are
+    intentionally ignored because signature def-use already covers them.
     """
-    candidates: list[tuple[tuple[int, int, int, int], dict[str, Any]]] = []
+    prompt_norms = {
+        _norm_doc_code_text(item.get("text", ""))
+        for item in code_items
+        if item.get("section") == "prompt_code"
+    }
+    candidates: list[tuple[tuple[int, int], dict[str, Any]]] = []
     seen: set[tuple[int, int]] = set()
     for doc in doc_items:
+        if doc.get("doc_section") != "returns":
+            continue
         dnorm = _norm_doc_code_text(doc.get("text", ""))
-        if len(dnorm) <= 1:
+        if len(dnorm) <= 1 or dnorm in DOCSTRING_MATCH_STOPWORDS:
             continue
         for code in code_items:
+            if code.get("section") != "completion":
+                continue
             cnorm = _norm_doc_code_text(code.get("text", ""))
-            if dnorm != cnorm:
+            if dnorm != cnorm or cnorm in prompt_norms:
+                continue
+            if not (_is_high_value_literal(doc.get("text", "")) or _is_high_value_literal(code.get("text", ""))):
                 continue
             key = (int(doc["idx"]), int(code["idx"]))
             if key in seen:
                 continue
             seen.add(key)
-            is_completion = 1 if code.get("section") == "completion" else 0
-            is_literal = 1 if _is_high_value_literal(doc.get("text", "")) or _is_high_value_literal(code.get("text", "")) else 0
-            if dnorm in DOCSTRING_MATCH_STOPWORDS and not is_literal:
-                continue
-            # Lower tuple sorts first: completion return literals are most useful.
-            priority = (0 if is_completion and is_literal else 1, 0 if is_completion else 1, 0 if is_literal else 1, int(code["idx"]))
-            candidates.append((priority, {"doc": key[0], "code": key[1], "source": "DocstringLexical"}))
+            candidates.append(((int(code["idx"]), int(doc["idx"])), {"doc": key[0], "code": key[1], "source": "DocstringReturnCandidate"}))
     candidates.sort(key=lambda item: item[0])
     return [pair for _, pair in candidates[:max_edges]]
 
 
-def add_docstring_to_code_edges(*, row: dict[str, Any], record: dict[str, Any], tokenizer: Any, max_edges: int) -> dict[str, Any]:
+def add_docstring_to_code_edges(*, row: dict[str, Any], record: dict[str, Any], tokenizer: Any, max_edges: int, use_llm: bool = False) -> dict[str, Any]:
     if max_edges <= 0:
         return record
     doc_items, code_items = _extract_doc_and_code_items(row)
@@ -218,42 +238,43 @@ def add_docstring_to_code_edges(*, row: dict[str, Any], record: dict[str, Any], 
         record.setdefault("annotation_meta", {})["docstring_edges_added"] = 0
         return record
 
-    payload = {
-        "task": "Add only high-confidence docstring-to-code dependency edges for Python FIM annotation.",
-        "rules": [
-            "Edges must go from a docstring token to a code token.",
-            "Never create docstring->docstring edges.",
-            "Never create code->docstring edges.",
-            "Prefer docstring words that describe parameters, return values, API behavior, or output constants.",
-            "Return at most %d pairs as JSON: {\"pairs\":[{\"doc\":0,\"code\":1}]}" % max_edges,
-        ],
-        "docstring_tokens": [[item["idx"], item["text"]] for item in doc_items],
-        "code_tokens": [[item["idx"], item["text"]] for item in code_items],
-    }
-    system = "You are a precise Python docstring-to-code dependency annotator. Return JSON only."
-    import os
-    client = get_thread_local_openai_client()
-    model = os.environ.get("ANNOTATE_MODEL", "gpt-4o-mini")
-    try:
-        response = _rate_limited_chat_completion(
-            client,
-            model=model,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-            temperature=0,
-            max_tokens=1024,
-            response_format={"type": "json_object"},
-        )
-    except Exception:
-        response = _rate_limited_chat_completion(
-            client,
-            model=model,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-            temperature=0,
-            max_tokens=1024,
-        )
-    raw = getattr(response.choices[0].message, "content", "") if not isinstance(response, str) else response
-    llm_pairs = [{**pair, "source": "DocstringTeacher"} for pair in _parse_docstring_pairs(str(raw))]
-    pairs = _candidate_docstring_pairs(doc_items, code_items, max_edges=max_edges) + llm_pairs
+    pairs = _candidate_docstring_pairs(doc_items, code_items, max_edges=max_edges)
+    if use_llm:
+        payload = {
+            "task": "Add only high-confidence docstring return-answer to completion-code dependency edges for Python FIM annotation.",
+            "rules": [
+                "Edges must go from a docstring Returns/return token to a completion code token.",
+                "Never create docstring->docstring edges.",
+                "Never create code->docstring edges.",
+                "Ignore Args/parameter descriptions; function signature def-use covers parameters.",
+                "Prefer return candidate answers that are absent from prompt code but present in completion code.",
+                "Return at most %d pairs as JSON: {\"pairs\":[{\"doc\":0,\"code\":1}]}" % max_edges,
+            ],
+            "docstring_tokens": [[item["idx"], item["text"], item.get("doc_section", "other")] for item in doc_items],
+            "code_tokens": [[item["idx"], item["text"], item.get("section", "")] for item in code_items],
+        }
+        system = "You are a precise Python docstring-return to completion-code dependency annotator. Return JSON only."
+        client = get_thread_local_openai_client()
+        model = os.environ.get("ANNOTATE_MODEL", "gpt-4o-mini")
+        try:
+            response = _rate_limited_chat_completion(
+                client,
+                model=model,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+                temperature=0,
+                max_tokens=1024,
+                response_format={"type": "json_object"},
+            )
+        except Exception:
+            response = _rate_limited_chat_completion(
+                client,
+                model=model,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+                temperature=0,
+                max_tokens=1024,
+            )
+        raw = getattr(response.choices[0].message, "content", "") if not isinstance(response, str) else response
+        pairs.extend({**pair, "source": "DocstringTeacher"} for pair in _parse_docstring_pairs(str(raw)))
 
     qwen_tokens = list(record.get("qwen_tokens") or [])
     labels = list(record.get("label") or [])
@@ -363,6 +384,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-teacher-edges", type=int, default=128)
     p.add_argument("--flush-every", type=int, default=5)
     p.add_argument("--docstring-edges", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--docstring-llm-edges", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--max-docstring-edges", type=int, default=32)
     p.add_argument("--overwrite-cache", action="store_true")
     return p.parse_args()
@@ -435,6 +457,7 @@ def main() -> None:
                     record=record,
                     tokenizer=tokenizer,
                     max_edges=args.max_docstring_edges,
+                    use_llm=args.docstring_llm_edges,
                 )
             return key, record, None
         except Exception as exc:
