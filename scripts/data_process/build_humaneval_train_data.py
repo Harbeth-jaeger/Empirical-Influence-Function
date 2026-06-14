@@ -656,7 +656,7 @@ def main() -> None:
     parser.add_argument("--mbpp-subset", choices=("full", "sanitized"), default="full")
     parser.add_argument("--mbpp-splits", nargs="+", default=["train", "validation", "prompt"])
     parser.add_argument("--apps-raw-path", type=Path, default=Path("data/raw_data/apps/train.jsonl"))
-    parser.add_argument("--out-dir", type=Path, default=Path("data/benchmark/train_data"))
+    parser.add_argument("--out-dir", type=Path, default=Path("data/benchmark/train_data/humaneval"))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--single-ratio", type=float, default=0.15)
     parser.add_argument("--max-samples", type=int, default=10000)

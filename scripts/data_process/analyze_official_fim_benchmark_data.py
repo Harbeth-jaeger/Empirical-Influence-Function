@@ -74,16 +74,23 @@ def analyze_file(path: Path) -> dict:
     task_counts = Counter(row.get("task_type", "unknown") for row in rows)
 
     length_values = defaultdict(list)
+    task_length_values = defaultdict(lambda: defaultdict(list))
     for row in rows:
-        for field in ("prefix", "suffix", "target"):
-            text = row.get(field) or ""
-            length_values[f"{field}_chars"].append(len(text))
-            length_values[f"{field}_rough_tokens"].append(rough_tokens(text))
-            length_values[f"{field}_nonempty_lines"].append(nonempty_lines(text))
-        context = (row.get("prefix") or "") + (row.get("suffix") or "")
-        length_values["context_chars"].append(len(context))
-        length_values["context_rough_tokens"].append(rough_tokens(context))
-        length_values["context_nonempty_lines"].append(nonempty_lines(context))
+        task_type = str(row.get("task_type", "unknown"))
+        prefix = row.get("prefix") or ""
+        suffix = row.get("suffix") or ""
+        target = row.get("target") or ""
+        full = prefix + target + suffix
+        for field, value in (("prefix", prefix), ("suffix", suffix), ("target", target), ("full", full)):
+            for bucket in (length_values, task_length_values[task_type]):
+                bucket[f"{field}_chars"].append(len(value))
+                bucket[f"{field}_rough_tokens"].append(rough_tokens(value))
+                bucket[f"{field}_nonempty_lines"].append(nonempty_lines(value))
+        context = prefix + suffix
+        for bucket in (length_values, task_length_values[task_type]):
+            bucket["context_chars"].append(len(context))
+            bucket["context_rough_tokens"].append(rough_tokens(context))
+            bucket["context_nonempty_lines"].append(nonempty_lines(context))
 
     total = len(rows)
     first = rows[0] if rows else {}
@@ -98,6 +105,10 @@ def analyze_file(path: Path) -> dict:
         "task_type_counts": dict(task_counts),
         "task_type_ratios": {k: round(v / total, 6) for k, v in task_counts.items()} if total else {},
         "length_stats": {name: stats(values) for name, values in sorted(length_values.items())},
+        "length_stats_by_task_type": {
+            task_type: {name: stats(values) for name, values in sorted(values_by_metric.items())}
+            for task_type, values_by_metric in sorted(task_length_values.items())
+        },
     }
 
 
@@ -151,6 +162,28 @@ def write_markdown(path: Path, summary: dict) -> None:
             f"| `{item['file']}` | {tok['mean']} | {tok['p50']} | {tok['p90']} | {lines_['mean']} | {lines_['p90']} |"
         )
 
+    lines += [
+        "",
+        "## SAFIM Length By Language And Subtask",
+        "",
+        "This table is intended to calibrate derived SAFIM train-data filtering. `context` means `prefix + suffix`; `full` means `prefix + target + suffix`.",
+        "",
+        "| language | task_type | n | context chars p50 | context chars p90 | context chars p95 | full chars p90 | target chars p90 | target lines p90 |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for item in summary["files"]:
+        if item.get("benchmark") != "safim":
+            continue
+        for task_type, count in item["task_type_counts"].items():
+            metric_map = item["length_stats_by_task_type"][task_type]
+            ctx = metric_map["context_chars"]
+            full = metric_map["full_chars"]
+            target = metric_map["target_chars"]
+            target_lines = metric_map["target_nonempty_lines"]
+            lines.append(
+                f"| {item['language']} | {task_type} | {count} | {ctx['p50']} | {ctx['p90']} | {ctx['p95']} | {full['p90']} | {target['p90']} | {target_lines['p90']} |"
+            )
+
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -186,7 +219,10 @@ def main() -> None:
     for item in file_summaries:
         base = {"file": item["file"], "benchmark": item["benchmark"], "language": item["language"]}
         for metric, values in item["length_stats"].items():
-            length_rows.append({**base, "metric": metric, **values})
+            length_rows.append({**base, "task_type": "all", "metric": metric, **values})
+        for task_type, metric_map in item["length_stats_by_task_type"].items():
+            for metric, values in metric_map.items():
+                length_rows.append({**base, "task_type": task_type, "metric": metric, **values})
 
     summary = {
         "test_dir": str(args.test_dir),
@@ -207,7 +243,7 @@ def main() -> None:
     write_csv(
         args.out_dir / "benchmark_length_stats.csv",
         length_rows,
-        ["file", "benchmark", "language", "metric", "min", "p25", "mean", "p50", "p75", "p90", "p95", "max"],
+        ["file", "benchmark", "language", "task_type", "metric", "min", "p25", "mean", "p50", "p75", "p90", "p95", "max"],
     )
     write_markdown(args.out_dir / "benchmark_data_analysis.md", summary)
 

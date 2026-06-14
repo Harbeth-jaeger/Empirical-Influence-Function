@@ -633,7 +633,22 @@ token_i 是 cue / source，token_j 是 consequence / target
 | `semantic` | 控制流、语法配对、语义约束 token -> 被约束 token。         |
 | `api`      | API 使用模式中的前置线索 -> 后续调用、资源释放或结果使用。 |
 
-标注 tokenizer 会过滤普通注释和 docstring，但保留 C/C++ 预处理指令，因为 `#include`、`#define` 等可能真实影响代码依赖和符号定义。
+标注 tokenizer 默认会过滤普通注释和 docstring，但保留 C/C++ 预处理指令，因为 `#include`、`#define` 等可能真实影响代码依赖和符号定义。
+
+需要注意，`humaneval` 训练数据是一个例外。它本身是 documented Python function 风格，docstring 是模型输入中真实可见的任务说明，不应像普通代码注释一样整体丢弃。当前处理方式是：
+
+```text
+普通代码注释 / 非任务 docstring:
+  仍然过滤，避免把自然语言噪声写进代码结构标注。
+
+humaneval documented function docstring:
+  保留在 ChatML prompt 中，只抽取 Args / Parameters / Returns / @param / @return 等与代码生成直接相关的信息。
+```
+
+这类 docstring 边只允许从前文可见信息指向后续 code token，尤其是 assistant completion token；不生成 docstring 内部互指，也不生成 code token 反向指向 docstring 的边。当前规则重点补充两类信息：
+
+- `type` 边：docstring 中的 `int/str/list/dict/set/boolean/array/optional/Any/pandas DataFrame`、reST `:class:\`str\``、CamelCase 类名等类型 token 指向对应参数、返回变量或返回表达式。
+- `semantic` 边：Args / Returns 描述中和 prefix/suffix/completion 代码同名且有生成约束的信息指向后续代码；Examples / doctest / Traceback 区域不参与，避免示例文本误连到代码。
 
 ### 2. 结构化规则：不调用 LLM 的边
 
@@ -2217,7 +2232,7 @@ data/benchmark/train_data/humaneval_python_build_report.json
 8. 做长度过滤，避免训练时被 tokenizer 截断；当前默认 `prompt <= 6000 chars`、`full_code <= 8000 chars`。
 9. 按 `single_line 15% / multi_line 85%` 采样，保留 `source_dataset`、`task_type`、`raw_task_id`、`target_line_range` 等字段。
 10. 渲染为与 benchmark prepare 阶段一致的 ChatML `[MASK] -> assistant target` 格式。
-11. 后续调用 `src/annotate` 完成结构边和 LLM 语义补边，再映射为 Qwen BPE compact annotated 格式。
+11. 后续调用 `scripts/benchmark/annotate_humaneval_train.py` 完成结构边、LLM 语义补边、docstring fact 边补充，并映射为 Qwen BPE compact annotated 格式。
 
 推荐主构造命令：
 
@@ -2232,9 +2247,58 @@ python scripts/data_process/build_humaneval_train_data.py \
   --max-full-chars 8000
 ```
 
+当前标注策略采用“结构规则 + LLM agent + docstring fact v2”的折中版本：
+
+```text
+结构规则:
+  bracket / defuse / call / return / type 等可以由 AST 或 tokenizer 稳定捕捉的边，不交给 LLM 重复判断。
+
+LLM agent:
+  只补充 dataflow / semantic / api 等需要语义判断的代码边。
+
+docstring fact v2:
+  对 humaneval 的 documented function docstring 做确定性补边，重点覆盖 Args / Parameters / Returns / @param / @return 中的 type 和少量 semantic 信息。
+  Examples / doctest / Traceback 不参与 docstring fact，避免示例文本污染训练监督。
+```
+
+全量 10K 标注建议直接覆盖标准输出路径：
+
+```text
+data/benchmark/train_data/humaneval_python_compact_annotated.jsonl
+data/benchmark/train_data/humaneval_python_annotation_cache.jsonl
+```
+
+由于 cache 中保存的是已经加过 docstring edges 的 compact record，如果此前用旧 docstring 规则标过抽检样本，全量重标时应使用 `--overwrite-cache`，确保 10K 样本全部按当前 docfact v2 规则重新生成。
+
+推荐 10K 全量标注命令：
+
+```bash
+nohup python scripts/benchmark/annotate_humaneval_train.py \
+  --input-path data/benchmark/train_data/humaneval_python_chatml.jsonl \
+  --output-path data/benchmark/train_data/humaneval_python_compact_annotated.jsonl \
+  --annotation-cache-path data/benchmark/train_data/humaneval_python_annotation_cache.jsonl \
+  --model-name-or-path models/Qwen2.5-Coder-7B-Instruct \
+  --samples-per-task 0 \
+  --task-types single_line multi_line \
+  --selection-seed 42 \
+  --annotation-mode agent \
+  --num-workers 12 \
+  --max-rounds 6 \
+  --max-teacher-edges 128 \
+  --docstring-edges \
+  --docstring-type-edges \
+  --no-docstring-llm-edges \
+  --max-docstring-edges 120 \
+  --overwrite-cache \
+  --flush-every 50 \
+  > runs/benchmark/annotate_humaneval_python_10k_docfact_v2.log 2>&1 &
+```
+
 #### 9.3 safim train data 获取与处理
 
-`safim` 是 syntax-aware FIM benchmark，强调 file-level / script-level 代码补全，并按结构化场景评估：
+当前 `safim` train data 的目标已经从早期方案收敛为：**用 The Stack v1 的真实多语言 file-level 源码，构造和 SAFIM official test 对齐的 `[MASK]` 补全样本；同时做必要的长度、注释、license、去污染和噪声过滤，保证训练数据高质量、无明显 test 泄漏。** 这一节只记录 train data 获取与处理，不写后续 annotation 方案。
+
+SAFIM official test 是 syntax-aware file-level FIM，当前重点对齐三类子任务：
 
 ```text
 algorithmic_block
@@ -2242,42 +2306,112 @@ control_flow_expression
 api_function_call
 ```
 
-因此，`safim` 训练数据应尽量保留完整文件上下文，而不是只保留单个函数片段。当前选择 `The Stack / The Stack v2` 作为最小可行训练源，原因是它覆盖 Python、Java、C++、C# 多语言文件级代码，和 safim 的多语言 syntax-aware 设置更匹配。
+和 `humaneval` train data 不同，`humaneval` 更偏 Python function-level docstring/function infilling，而 `safim` 是 Python / Java / C++ / C# 四语言 file-level / script-level infilling。因此 `safim` train 样本不能只截取孤立函数签名或很短函数片段，而要尽量保留 target 周围的真实文件级上下文，例如 import/include/using、类和函数外壳、局部变量定义、前后状态更新、API receiver/type 信息以及后续使用。
 
-原始数据建议放在：
+当前落地版本使用 The Stack v1，而不是 The Stack v2。原因是 The Stack v1 在 Hugging Face 数据集中直接包含源码 `content` 字段，可以 streaming 读取并边读边过滤；The Stack v2 更新、更规范，但 HF 侧主要是 metadata / SWHIDs，真实源码内容还需要 Software Heritage S3 访问权限，不适合当前快速闭环。正式构造不全量下载四语言原始数据，而是按语言 streaming 读取，过滤后只缓存被用到的 source pool：
 
 ```text
-data/raw_data/the_stack/
-data/raw_data/the_stack_v2/
+data/raw_data/the_stack_v1/safim_source_pool/python_sources.jsonl
+data/raw_data/the_stack_v1/safim_source_pool/java_sources.jsonl
+data/raw_data/the_stack_v1/safim_source_pool/cpp_sources.jsonl
+data/raw_data/the_stack_v1/safim_source_pool/csharp_sources.jsonl
 ```
 
-派生后的训练数据建议按语言组织：
+最终训练数据统一放在：
 
 ```text
 data/benchmark/train_data/safim/safim_python_train_canonical.jsonl
 data/benchmark/train_data/safim/safim_java_train_canonical.jsonl
 data/benchmark/train_data/safim/safim_cpp_train_canonical.jsonl
 data/benchmark/train_data/safim/safim_csharp_train_canonical.jsonl
+data/benchmark/train_data/safim/safim_*_train_chatml.jsonl
+data/benchmark/train_data/safim/safim_train_canonical.jsonl
 data/benchmark/train_data/safim/safim_train_chatml.jsonl
-data/benchmark/train_data/safim/safim_train_compact_annotated.jsonl
 data/benchmark/train_data/safim/build_report.json
 ```
 
-构造流程：
+当前已构造规模是每个语言 `10K`，总计 `40K`。语言内部子任务比例固定为：
 
-1. 从 The Stack / The Stack v2 中按语言抽取 Python / Java / C++ / C# 文件。
-2. 保留 permissive license、文件长度适中、非 generated、非 minified、非 test fixture 的源码文件。
-3. 使用 tree-sitter 或对应语言 parser 解析完整文件。
-4. 构造 `algorithmic_block`：mask loop body、if/else body、case body、函数内连续 statement block 或核心算法更新块。
-5. 构造 `control_flow_expression`：mask `if` / `elif` / `while` / `for` / `switch` 等控制结构中的 condition、range、update 或 case expression。
-6. 构造 `api_function_call`：mask 完整 call expression / method invocation，保留 import、receiver、变量定义、类型和上下文。
-7. 验证 `prefix + target + suffix == original_code`，并对回填代码做 parse / compile sanity check；Python 可先用 parse，Java / C++ / C# 至少先做 parser 级检查。
-8. 过滤不可解析、target 为空、target 只含注释、target 过短或过长、上下文过长、mask 位置不稳定的样本。
-9. 按 `algorithmic_block 45% / control_flow_expression 45% / api_function_call 10%` 采样，并在每条样本中保留 `language`、`task_type`、`ast_node_type`、`source_dataset`、`repo_or_file_meta`。
-10. 渲染为与 safim prepare 阶段一致的 ChatML `[MASK] -> assistant target` 格式。
-11. 调用 `src/annotate` 完成结构边和 LLM 语义补边，再映射为 Qwen BPE compact annotated 格式。
+```text
+algorithmic_block        45%  每语言 4500
+control_flow_expression  45%  每语言 4500
+api_function_call        10%  每语言 1000
+```
 
-采样时需要同时控制语言分布和 task type 分布。建议第一版不要强行按 safim test 的语言样本数比例训练，因为 C++ 样本在 test 中占比很高，容易让训练 mixture 过度偏向 C++。更稳妥的做法是先按语言均衡或轻度接近 test 分布采样，再在每种语言内部执行 `45% / 45% / 10%` 的 task ratio。
+这个比例是有意设计的：SAFIM official 中 `algorithmic_block` 和 `control_flow_expression` 是主体，`api_function_call` 数量很少；训练侧给 API call 10% 的轻度 oversampling，可以避免 API 子任务完全被淹没，同时仍然保持整体任务形态接近 official benchmark。
+
+需要注意，`source_pool` 的行数会小于最终样本数，这是正常现象。当前 builder 允许一个高质量源文件贡献多个不重叠 FIM span，最多对应三类 subtask 各一条，因此一个 source file 最多产出 3 条训练样本。当前 10K 构造中大致是每语言约 6K 个 source file 产出 10K 条样本，例如：
+
+```text
+python:  6125 sources -> 10000 samples, max 3 samples/source
+java:    6336 sources -> 10000 samples, max 3 samples/source
+cpp:     6271 sources -> 10000 samples, max 3 samples/source
+csharp:  5945 sources -> 10000 samples, max 3 samples/source
+```
+
+这和 SAFIM 的 file-level 设置是匹配的：一个真实文件中不同位置、不同语法结构都可以成为有效 FIM 监督。为了避免单个文件刷出过多近似样本，当前上限自然受三类 task 限制，不会从同一文件密集切出几十条样本。
+
+文件清洗先在源文件级别做，目标是尽早排除不适合 SAFIM FIM 的低质文件。当前主要过滤包括：
+
+- 只保留 Python / Java / C++ / C# 四种语言。
+- 默认要求 permissive license，避免 unknown / non-permissive license 混入。
+- 按官方 SAFIM 长度分布约束样本上下文，使用 `official_p95` profile 控制 `prefix + suffix` 长度。
+- 源文件长度和行数做上下限过滤，默认 `min_file_chars=800`、`max_file_chars=12000`、`min_file_lines=20`。
+- 过滤 generated / vendored / config / fixture / benchmark 路径，以及超长单行、平均行长异常、重复文件。
+- 过滤明显与 SAFIM official test 相关的 repo/path，例如 `safim`、`human-eval`、`humaneval`、`benchmark` 等。
+- 对 full code 和 target 做 normalized hash 去污染，避免 exact overlap。
+
+语言特定过滤也已经落地：Python 过滤纯配置或无逻辑脚本；Java 过滤纯 POJO、interface-only 和 annotation-heavy 文件；C++ 过滤只有声明的 header 或无函数体文件；C# 过滤纯 model / auto-property 风格文件。The Stack 文件开头经常有 license banner 或超长说明块，而 SAFIM official test 通常没有这种开局大块注释，所以当前默认会剥离**文件开头的大块注释 / license header / shebang / Python module docstring**，再计算长度、抽 span 和构造样本；中间的普通注释会保留，因为它属于真实 file-level 上下文。
+
+候选 span 抽取遵循 `prefix + target + suffix == full_code`。Python 使用 `ast` 抽取稳定语法 span；Java / C++ / C# 当前使用保守的文本、brace 和 statement scanner，而不是完整 AST/parser，原因是三种语言的工程化 AST 依赖更重，且 The Stack 单文件常缺少 project/classpath 上下文。当前策略优先保证 span 边界保守、target 可读、任务类型贴近 SAFIM；如果单个脏文件触发 scanner 异常，会计入 `candidate_exception:*` 并跳过，不让整轮构造中断。
+
+三类子任务的抽取原则如下：
+
+- `algorithmic_block`：抽取 loop/if/else/try/catch 等结构内的短 block，或函数/方法内连续 1-5 行 statement group。优先 assignment、augmented assignment、return、collection update、accumulator update 等有真实状态变化的片段。过滤空白、纯注释、单独括号、极低信息 target。
+- `control_flow_expression`：抽取 `if` / `while` / `for` / `switch` / `catch` 等控制结构里的 condition、iterable 或控制表达式。要求 target 是完整表达式，不能切半个 token 或破坏括号结构。
+- `api_function_call`：抽取完整 call expression / method invocation / constructor/factory call。优先带 receiver、namespace、module 或类型上下文的调用，例如 `torch.arange(...)`、`obj.method(...)`、`Files.readAllBytes(...)`。过滤 `print/log/debug/assert/len/str/super` 等低价值调用。
+
+上下文长度不是随意截断，而是参考 official SAFIM 的实际长度分布。当前 `official_p95` profile 记录的 `prefix + suffix` 上限为：
+
+```text
+python:  block 2511, control 2404, api 3682
+java:    block 2900, control 2942, api 4540
+cpp:     block 1877, control 1972, api 4444
+csharp:  block 10922, control 10991, api 3170
+```
+
+因此 train 样本整体长度会贴近 official test，而不会被 The Stack 中很长的工业文件拖大。构造后用 viewer 做人工对比，确认 train 和 official test 在 file-level 上下文、mask 位置、target 长度和任务类型上基本对齐。
+
+当前构造命令为：
+
+```bash
+nohup python scripts/data_process/build_safim_train_data.py \
+  --samples-per-language 10000 \
+  --task-ratios algorithmic_block=0.45,control_flow_expression=0.45,api_function_call=0.10 \
+  --out-dir data/benchmark/train_data/safim \
+  --test-dir data/benchmark/test_data \
+  --prepare-viewer-data \
+  --viewer-dir outputs/benchmark/safim_stack_probe/viewer_data \
+  --length-profile official_p95 \
+  --strip-leading-comments \
+  --seed 42 \
+  > runs/build_safim_train_10k.log 2>&1 &
+```
+
+构造完成后生成 paired viewer，用于逐语言、逐 subtask 对比左侧 train 和右侧 official test：
+
+```bash
+python tools/viz_data/build_benchmark_subtask_viewer.py \
+  --test-dir outputs/benchmark/safim_stack_probe/viewer_data \
+  --out outputs/benchmark/safim_stack_probe/safim_train_vs_official_paired_viewer.html \
+  --samples-per-task 10 \
+  --seed 42 \
+  --paired-safim \
+  --task-types algorithmic_block control_flow_expression api_function_call \
+  --title "SAFIM Train 10K vs Official Paired Viewer"
+```
+
+人工检查重点是：`[MASK]` 是否自然、target 是否完整、task type 是否对标、开头 license/banner 是否已去除、是否仍有题面文字或非代码噪声、train/test 长度是否明显错位。当前版本没有强制接入多语言编译检查；原因是 Python 可以 `ast` 检查，但 Java/C++/C# 单文件往往缺少 project 依赖，直接编译会误杀很多真实源码。后续如果发现 C++/Java/C# 噪声仍偏多，可以增加可选 `--syntax-check` 或 tree-sitter parser sanity，但不作为当前 10K 版本的前置条件。
 
 #### 9.4 后续优先级
 
