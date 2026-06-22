@@ -12,6 +12,10 @@ import dataclasses
 
 
 SUBTYPE_COLORS: dict[str, str] = {
+    "declaration": "#0ea5e9",
+    "function": "#f97316",
+    "class": "#22c55e",
+    "semantics": "#a855f7",
     "bracket": "#64748b",  # slate  — 括号匹配
     "defuse": "#0ea5e9",  # sky    — def-use
     "call": "#f97316",  # orange — 函数调用

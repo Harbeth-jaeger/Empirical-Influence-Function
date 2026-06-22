@@ -27,6 +27,10 @@ if str(REPO_ROOT) not in sys.path:
 
 
 SUBTYPE_COLORS: dict[str, str] = {
+    "declaration": "#0ea5e9",
+    "function": "#f97316",
+    "class": "#22c55e",
+    "semantics": "#a855f7",
     "bracket": "#64748b",
     "defuse": "#0ea5e9",
     "call": "#f97316",
@@ -187,7 +191,7 @@ def infer_prompt_len(row: dict[str, Any], meta: dict[str, Any] | None) -> int:
 def normalize_edges(row: dict[str, Any], seq_len: int) -> list[dict[str, Any]]:
     edges: list[dict[str, Any]] = []
     seen: set[tuple[int, int, str]] = set()
-    for edge in row.get("attention_edges") or []:
+    for edge in list(row.get("attention_edges") or []) + list(row.get("prompt_attention_edges") or []):
         if not isinstance(edge, dict):
             continue
         try:
@@ -379,7 +383,7 @@ def build_sample_payload(
         for i in range(len(input_ids))
     ]
     add_visual_mask_newlines(tokens)
-    edges = normalize_edges({"attention_edges": row.get("attention_edges") or []}, len(input_ids))
+    edges = normalize_edges(row, len(input_ids))
 
     if attention_topk:
         for rows in attention_topk.values():

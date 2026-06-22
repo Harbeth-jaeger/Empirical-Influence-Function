@@ -90,7 +90,7 @@ def build_code_and_subwords(token_texts: list[str]) -> tuple[str, list[SimpleNam
 def build_correlations(row: dict[str, Any], token_texts: list[str]) -> list[SimpleNamespace]:
     correlations: list[SimpleNamespace] = []
     seq_len = len(token_texts)
-    for edge in row.get("attention_edges") or []:
+    for edge in list(row.get("attention_edges") or []) + list(row.get("prompt_attention_edges") or []):
         try:
             src = int(edge.get("src", edge.get("token_i_idx", -1)))
             dst = int(edge.get("dst", edge.get("token_j_idx", -1)))
