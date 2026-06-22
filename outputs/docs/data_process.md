@@ -9,30 +9,6 @@ CodeSearchNet raw jsonl/jsonl.gz/zip
   -> 可视化标注边，抽查质量
 ```
 
-## 预先准备
-
-从仓库根目录运行脚本，脚本里大多使用相对路径。建议使用项目已有环境：
-
-```bash
-export PATH="$PWD/.local/bin:$PATH"
-eval "$($PWD/.local/bin/micromamba shell hook -s bash 2>/dev/null || micromamba shell hook -s bash)"
-export MAMBA_ROOT_PREFIX="$PWD/.micromamba"
-micromamba activate "$PWD/.micromamba/envs/eif-bench"
-```
-
-需要的主要包是 `transformers`、`torch`、`tqdm`、`openai`，以及项目内的 `src/annotate`、`src/sft` 模块。标注如果走新版 `target_evidence` 规则，不需要外部 LLM；如果走旧版 `oneshot/agent` 标注，则需要配置 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`ANNOTATE_MODEL` 等环境变量。
-
-原始 CSN 数据默认按语言放在类似下面的位置：
-
-```text
-data/raw_data/codesearchnet/python/...
-data/raw_data/codesearchnet/java/...
-data/raw_data/codesearchnet/cpp/...
-data/raw_data/codesearchnet/csharp/...
-```
-
-多语言构造脚本也能读取 `.jsonl`、`.jsonl.gz`，以及语言级 zip 包里的 jsonl/jsonl.gz，运行时最好显式传入输入输出路径。
-
 ## 1. 多语言 CSN 单行 FIM 构造
 
 推荐入口：`scripts/data_process/build_codesearchnet_single.py`
@@ -265,31 +241,3 @@ python tools/viz_annotation/build_dynamic_annotation_viewer.py \
 ```
 
 如果想叠加模型 attention top-k，需要加 `--with_attention`，但是这会加载模型，耗显存。
-
-## 6. 建议交接顺序
-
-建议给学姐上传这些文件：
-
-```text
-scripts/data_process/build_codesearchnet_single.py
-scripts/go_singleline_fim_exp/build_go_single_data.py
-scripts/go_singleline_fim_exp/go_single_pipeline.py
-scripts/go_singleline_fim_exp/annotate_chatml_with_src_annotate.py
-scripts/benchmark/annotate_safim_train.py
-src/annotate/target_evidence_annot.py
-scripts/benchmark/sft_data_convert.py
-tools/viz_annotation/visualize_annotation_edges.py
-tools/viz_annotation/build_dynamic_annotation_viewer.py
-tools/viz_annotation/dynamic_annotation_viewer.html
-src/annotate/viz_utils.py
-```
-
-真正建议她先跑的最短链路是：
-
-```text
-build_codesearchnet_single.py
-  -> annotate_safim_train.py --annotation-mode target_evidence
-  -> build_dynamic_annotation_viewer.py
-```
-
-`go_singleline_fim_exp` 目录更像方法历史和 Go 规则参考，不建议她直接拿它作为多语言主入口，除非要复现实验旧结果。
