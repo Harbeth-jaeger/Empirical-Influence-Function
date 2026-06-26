@@ -355,6 +355,11 @@ def _render_html(graph_data: dict, title: str, code_html: str = "") -> str:
               </div>
             </div>
 
+            <div class="sec">
+              <div class="sec-title">View</div>
+              <button class="dir-btn" id="show-all-btn" title="Draw every edge across all tokens">⊕ Show all edges</button>
+            </div>
+
             <div id="info-panel">
               <p class="ph">Click a highlighted token in the code to inspect its correlations.</p>
             </div>
@@ -419,6 +424,7 @@ def _render_html(graph_data: dict, title: str, code_html: str = "") -> str:
         let activeIdx     = null;   // int idx of the selected token, or null
         let showDir       = 'both'; // 'out' | 'in' | 'both'
         let activeSubtypes = new Set(ALL_SUBTYPES);
+        let showAll       = false;  // true → draw every edge across all tokens
 
         // ── Helpers ────────────────────────────────────────────────────────────────
         const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -438,6 +444,8 @@ def _render_html(graph_data: dict, title: str, code_html: str = "") -> str:
         // ── Clear everything ───────────────────────────────────────────────────────
         function clearAll() {{
           activeIdx = null;
+          showAll = false;
+          document.getElementById('show-all-btn').classList.remove('active');
           document.querySelectorAll('.tok').forEach(s => {{
             s.classList.remove('selected');
             s.style.background = '';
@@ -505,6 +513,49 @@ def _render_html(graph_data: dict, title: str, code_html: str = "") -> str:
             `<div class="info-name">${{esc(globalSubtype)}}</div>` +
             `<div class="info-count">${{count}} edge${{count !== 1 ? 's' : ''}} across all tokens</div>` +
             `<p class="ph" style="margin-top:8px">Click a token to inspect its edges,<br>or click the edge type again to exit.</p>`;
+        }}
+
+        // ── Show-all view ──────────────────────────────────────────────────────────
+        // Draw every edge across all tokens at once, regardless of subtype.
+        function drawAllEdges() {{
+          arrowSvg.querySelectorAll('path.arrow').forEach(el => el.remove());
+          document.querySelectorAll('.tok').forEach(s => {{
+            s.classList.remove('selected');
+            s.style.background = '';
+            s.style.boxShadow  = '';
+          }});
+          if (!showAll) return;
+
+          const seen = new Set();
+          let count = 0;
+          GRAPH.links.forEach(l => {{
+            const key = `${{l.source}}-${{l.target}}-${{l.color}}`;
+            if (seen.has(key)) return;
+            seen.add(key);
+
+            const fromEl = spanByIdx(l.source);
+            const toEl   = spanByIdx(l.target);
+            if (!fromEl || !toEl) return;
+
+            fromEl.style.background = l.color + '4a';
+            fromEl.style.boxShadow  = `0 0 0 1px ${{l.color}}99`;
+            toEl.style.background   = l.color + '4a';
+            toEl.style.boxShadow    = `0 0 0 1px ${{l.color}}99`;
+
+            const fr = fromEl.getBoundingClientRect();
+            const tr = toEl.getBoundingClientRect();
+            appendArrow(
+              fr.left + fr.width / 2, fr.top + fr.height / 2,
+              tr.left + tr.width / 2, tr.top + tr.height / 2,
+              l.color
+            );
+            count++;
+          }});
+
+          document.getElementById('info-panel').innerHTML =
+            `<div class="info-name">All edges</div>` +
+            `<div class="info-count">${{count}} edge${{count !== 1 ? 's' : ''}} across all tokens</div>` +
+            `<p class="ph" style="margin-top:8px">Click the button again to exit,<br>or click a token / edge type to focus.</p>`;
         }}
 
         // ── Highlight tokens in code ───────────────────────────────────────────────
@@ -595,6 +646,11 @@ def _render_html(graph_data: dict, title: str, code_html: str = "") -> str:
         document.querySelectorAll('.tok').forEach(span => {{
           span.addEventListener('click', e => {{
             e.stopPropagation();
+            // Exit show-all view if active
+            if (showAll) {{
+              showAll = false;
+              document.getElementById('show-all-btn').classList.remove('active');
+            }}
             // Exit global view if active
             if (globalSubtype !== null) {{
               globalSubtype = null;
@@ -616,13 +672,15 @@ def _render_html(graph_data: dict, title: str, code_html: str = "") -> str:
 
         // ── Event: redraw arrows on scroll (token positions change) ───────────────
         document.getElementById('code-area').addEventListener('scroll', () => {{
-          if (activeIdx !== null) drawArrows();
+          if (showAll) drawAllEdges();
+          else if (globalSubtype !== null) drawGlobalEdges();
+          else if (activeIdx !== null) drawArrows();
         }}, {{ passive: true }});
 
         // ── Event: direction toggle ────────────────────────────────────────────────
-        document.querySelectorAll('.dir-btn').forEach(btn => {{
+        document.querySelectorAll('.dir-group .dir-btn').forEach(btn => {{
           btn.addEventListener('click', () => {{
-            document.querySelectorAll('.dir-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.dir-group .dir-btn').forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
             showDir = btn.dataset.dir;
             refresh();
@@ -656,6 +714,10 @@ def _render_html(graph_data: dict, title: str, code_html: str = "") -> str:
                 '<p class="ph">Click a highlighted token in the code to inspect its correlations.</p>';
             }} else {{
               // Enter global view for this subtype
+              if (showAll) {{
+                showAll = false;
+                document.getElementById('show-all-btn').classList.remove('active');
+              }}
               globalSubtype = cb.value;
               document.querySelectorAll('.subtype-cb').forEach(c => {{
                 c.checked = (c.value === cb.value);
@@ -666,6 +728,30 @@ def _render_html(graph_data: dict, title: str, code_html: str = "") -> str:
               drawGlobalEdges();
             }}
           }});
+        }});
+
+        // ── Event: show-all toggle ─────────────────────────────────────────────────
+        // Draw every edge across all tokens; click again (or click a token / edge
+        // type / background) to exit.
+        document.getElementById('show-all-btn').addEventListener('click', () => {{
+          const btn = document.getElementById('show-all-btn');
+          if (showAll) {{
+            showAll = false;
+            btn.classList.remove('active');
+            clearAll();
+          }} else {{
+            // Reset any token / subtype focus first
+            globalSubtype = null;
+            activeIdx = null;
+            activeSubtypes = new Set(ALL_SUBTYPES);
+            document.querySelectorAll('.subtype-cb').forEach(c => {{
+              c.checked = true;
+              c.style.outline = '';
+            }});
+            showAll = true;
+            btn.classList.add('active');
+            drawAllEdges();
+          }}
         }});
         </script>
         </body>

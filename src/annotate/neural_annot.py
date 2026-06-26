@@ -18,6 +18,12 @@ from dataclasses import dataclass
 
 _OPENAI_RATE_LOCK = threading.Lock()
 _OPENAI_LAST_REQUEST_TS = 0.0
+
+# Cache tree-sitter Language objects per language name (immutable, thread-safe).
+# Parsers are still created per call because tree-sitter Parser is not
+# thread-safe and get_edges runs under many worker threads.
+_TS_LANG_CACHE: dict[str, Any] = {}
+_TS_LANG_LOCK = threading.Lock()
 _OPENAI_CLIENT_LOCAL = threading.local()
 
 
@@ -84,7 +90,14 @@ def _build_openai_client() -> OpenAI:
     if os.environ.get("OPENAI_BASE_URL"):
         kwargs["base_url"] = os.environ["OPENAI_BASE_URL"]
 
-    disable_proxy = _env_flag("ANNOTATE_HTTP_PROXY_NONE") or _env_flag("HUAWEI_DISABLE_PROXY")
+    # Bypass any HTTP(S)_PROXY for local endpoints by default — otherwise a proxy
+    # set for VPN access hijacks requests to localhost and fails with
+    # APIConnectionError. Explicit ANNOTATE_HTTP_PROXY_NONE / HUAWEI_DISABLE_PROXY
+    # still override this.
+    explicit_no_proxy = _optional_env_flag("ANNOTATE_HTTP_PROXY_NONE", "HUAWEI_DISABLE_PROXY")
+    base_url = str(kwargs.get("base_url", "") or "")
+    is_local_endpoint = any(h in base_url for h in ("localhost", "127.0.0.1", "0.0.0.0", "::1"))
+    disable_proxy = explicit_no_proxy if explicit_no_proxy is not None else is_local_endpoint
     verify_ssl = _env_flag("ANNOTATE_VERIFY_SSL", default=True)
     if _env_flag("HUAWEI_INSECURE"):
         verify_ssl = False
@@ -117,6 +130,22 @@ def get_thread_local_openai_client() -> OpenAI:
 def _is_rate_limit_error(exc: Exception) -> bool:
     text = str(exc).lower()
     return "429" in text or "too many requests" in text or "rate limit" in text
+
+
+def _is_retryable_error(exc: Exception) -> bool:
+    """Rate limits plus transient network / server errors worth retrying
+    (connection drops, timeouts, 5xx from an overloaded or restarting endpoint)."""
+    if _is_rate_limit_error(exc):
+        return True
+    name = type(exc).__name__.lower()
+    if any(s in name for s in ("connection", "timeout", "internalservererror", "apierror")):
+        return True
+    text = str(exc).lower()
+    return any(s in text for s in (
+        "connection error", "connection reset", "connection aborted", "timed out",
+        "timeout", "bad gateway", "service unavailable", "gateway timeout",
+        "error code: 500", "error code: 502", "error code: 503", "error code: 504",
+    ))
 
 
 def _chat_response_message(response: Any) -> Any | None:
@@ -211,7 +240,10 @@ def _huawei_text_content_messages(messages: Any) -> Any:
 
 def _rate_limited_chat_completion(client: OpenAI, **kwargs):
     global _OPENAI_LAST_REQUEST_TS
-    min_interval = float(os.environ.get("ANNOTATE_MIN_REQUEST_INTERVAL", "1.2"))
+    # Default 0 = no artificial spacing (throughput bounded only by num_workers
+    # and endpoint latency). The reactive 429 backoff below still protects
+    # rate-limited gateways; set ANNOTATE_MIN_REQUEST_INTERVAL to re-enable.
+    min_interval = float(os.environ.get("ANNOTATE_MIN_REQUEST_INTERVAL", "0"))
     max_retries = int(os.environ.get("ANNOTATE_MAX_RETRIES", "8"))
     base_sleep = float(os.environ.get("ANNOTATE_RETRY_BASE_SLEEP", "10"))
     request_timeout = os.environ.get("ANNOTATE_REQUEST_TIMEOUT")
@@ -276,11 +308,15 @@ def _rate_limited_chat_completion(client: OpenAI, **kwargs):
                 )
             return response
         except Exception as exc:
-            if attempt >= max_retries or not _is_rate_limit_error(exc):
+            if attempt >= max_retries or not _is_retryable_error(exc):
                 raise
-            # ModelArts sometimes reports both 1 QPS and 3 RPM. Back off generously.
-            sleep_s = max(base_sleep * (attempt + 1), min_interval) + random.uniform(0, 1.5)
-            print(f"[warn] rate limited, retry {attempt + 1}/{max_retries} after {sleep_s:.1f}s: {exc}")
+            if _is_rate_limit_error(exc):
+                # ModelArts sometimes reports both 1 QPS and 3 RPM. Back off generously.
+                sleep_s = max(base_sleep * (attempt + 1), min_interval) + random.uniform(0, 1.5)
+            else:
+                # Transient network / 5xx error: exponential backoff, capped.
+                sleep_s = min(2 ** attempt, 30) + random.uniform(0, 1.0)
+            print(f"[warn] retryable error, retry {attempt + 1}/{max_retries} after {sleep_s:.1f}s: {exc}")
             time.sleep(sleep_s)
 
 
@@ -330,6 +366,7 @@ _CALL_NODE_TYPES = {
 _SELECTOR_NODE_TYPES = {
     "selector_expression",       # Go: pkg.Func / obj.Method / val.Field
     "member_access_expression",  # C#: obj.Method
+    "member_expression",         # JavaScript/TypeScript: obj.method / obj.prop / this._x
     "field_expression",          # Rust/C variants
     "qualified_name",            # Java/C# namespace or type member
     "scoped_identifier",         # C++/Rust A::B
@@ -425,9 +462,15 @@ class SyntacticCheckerTool:
             return []
         try:
             from tree_sitter import Language, Parser
-            pkg = importlib.import_module(pkg_name)
-            lang = Language(pkg.language())
-            parser = Parser(lang)
+            lang = _TS_LANG_CACHE.get(language)
+            if lang is None:
+                with _TS_LANG_LOCK:
+                    lang = _TS_LANG_CACHE.get(language)
+                    if lang is None:
+                        pkg = importlib.import_module(pkg_name)
+                        lang = Language(pkg.language())
+                        _TS_LANG_CACHE[language] = lang
+            parser = Parser(lang)  # per-call: Parser is not thread-safe
 
             # C# / Java: a bare method outside a class is not a valid top-level
             # construct in tree-sitter's grammar — it parses as global_statement /
@@ -1363,7 +1406,7 @@ class AnnotatorAgent:
                 model=self.model,
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
                 temperature=0,
-                max_tokens=int(os.environ.get("ANNOTATE_MAX_TOKENS", "2048")),
+                max_tokens=int(os.environ.get("ANNOTATE_MAX_TOKENS", "1024")),
                 response_format={"type": "json_object"},
             )
         except Exception:
@@ -1372,7 +1415,7 @@ class AnnotatorAgent:
                 model=self.model,
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
                 temperature=0,
-                max_tokens=int(os.environ.get("ANNOTATE_MAX_TOKENS", "2048")),
+                max_tokens=int(os.environ.get("ANNOTATE_MAX_TOKENS", "1024")),
             )
 
         content = _chat_response_text(response)
