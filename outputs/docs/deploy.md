@@ -35,6 +35,55 @@ export GOFMT_BIN=/path/to/gofmt
 
 关于调用模型进行在线推理、辅助标注，华为官方提供了部署在他们机器上的模型。旧资源模板见 `scripts/huawei_deploy/vlm.py`，当前新资源调用模板见 `scripts/huawei_deploy/new_vlm.py`。
 
+### 专家精简入口
+
+如果只是交接给华为专家运行标注，优先使用精简封装。先由专家按自己的资源填写这 4 个变量：
+
+```bash
+export MODEL_PATH=<tokenizer/base_model_path>
+export ANNOTATE_MODEL=<huawei_or_openai_compatible_model_name>
+export OPENAI_BASE_URL=<openai_compatible_base_url>
+export OPENAI_API_KEY=<openai_api_key_or_huawei_id>
+```
+
+然后运行：
+
+```bash
+bash scripts/huawei_deploy/annotate_simple.sh \
+  --model-path "$MODEL_PATH" \
+  --annotate-model "$ANNOTATE_MODEL" \
+  --base-url "$OPENAI_BASE_URL" \
+  --api-key "$OPENAI_API_KEY" \
+  --hw-appkey "$HW_APPKEY" \
+  --hw-operator "$HW_OPERATOR" \
+  --workers 8 \
+  "$TRAIN_DATA_1" \
+  "$TRAIN_DATA_2" \
+  "$TRAIN_DATA_3"
+```
+
+这个脚本默认设置为当前最稳的生产配置：`oneshot`、`MAX_ROUNDS=1`、华为 template mode、stream、timeout、cache 复用、`FORCE_PREPARE=0`、full 模式不生成可视化。第一次运行如果对应 prepared 文件不存在，会自动 prepare；中断后重启会优先跳过已有 prepare，并复用已有 cache/compact。
+
+小样本检查可以加 `--check`：
+
+```bash
+bash scripts/huawei_deploy/annotate_simple.sh --check \
+  --model-path "$MODEL_PATH" \
+  --annotate-model "$ANNOTATE_MODEL" \
+  --base-url "$OPENAI_BASE_URL" \
+  --api-key "$OPENAI_API_KEY" \
+  --hw-appkey "$HW_APPKEY" \
+  --hw-operator "$HW_OPERATOR" \
+  --workers 4 \
+  "$TRAIN_DATA_1"
+```
+
+需要强制重做 prepare 时才加：
+
+```bash
+--force-prepare
+```
+
 ### 0. 进入仓库和环境
 
 ```bash
