@@ -1,0 +1,8 @@
+# Project dependency entrypoint.
+# Use the split files when installing a narrow environment, e.g.
+#   pip install -r requirements/annotate.txt
+#   pip install -r requirements/train.txt
+-r requirements/base.txt
+-r requirements/annotate.txt
+-r requirements/train.txt
+-r requirements/dev.txt

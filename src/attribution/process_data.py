@@ -19,8 +19,8 @@ import tree_sitter_go as tsgo # pip install tree-sitter tree-sitter-go
 from tree_sitter import QueryCursor
 
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-os.environ["HF_HOME"]="/mnt/nvme0n1/hf_hub"
-os.environ["TRANSFORMERS_CACHE"]="/mnt/nvme0n1/hf_hub"
+os.environ["HF_HOME"]="/mnt/nvme0n1/wenhao/hf_cache"
+os.environ["TRANSFORMERS_CACHE"]="/mnt/nvme0n1/wenhao/hf_cache"
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)

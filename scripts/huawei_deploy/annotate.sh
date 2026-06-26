@@ -35,8 +35,8 @@ if run_batch_if_requested "$@"; then
   exit 0
 fi
 
-RAW_DATA="${HUAWEI_RAW_DATA:-${RAW_DATA:-${TRAIN_DATA:-data/huawei_data/cloud_core_test_25.JunJunly_GoOnly_length_filter.jsonl}}}"
-PROCESSED_DIR="${HUAWEI_PROCESSED_DIR:-data/huawei_data/processed}"
+RAW_DATA="${HUAWEI_RAW_DATA:-${RAW_DATA:-${TRAIN_DATA:-/mnt/nvme0n1/wenhao/datasets/Empirical-Influence-Function/external/huawei_data/cloud_core_test_25.JunJunly_GoOnly_length_filter.jsonl}}}"
+PROCESSED_DIR="${HUAWEI_PROCESSED_DIR:-/mnt/nvme0n1/wenhao/datasets/Empirical-Influence-Function/interim/huawei_data/processed}"
 RAW_BASENAME="$(basename "$RAW_DATA")"
 RAW_STEM="${RAW_BASENAME%.*}"
 CHATML_DATA="${HUAWEI_CHATML_DATA:-$PROCESSED_DIR/${RAW_STEM}_chatml.jsonl}"
@@ -57,7 +57,7 @@ ENABLE_VISUALIZE="${ENABLE_VISUALIZE:-1}"
 ANNOTATION_MODE="${ANNOTATION_MODE:-agent}"
 CHECK_RUN_NAME="${CHECK_RUN_NAME:-${RAW_STEM}_check_huawei_${ANNOTATION_MODE}}"
 FULL_RUN_NAME="${FULL_RUN_NAME:-${RAW_STEM}_full_huawei_${ANNOTATION_MODE}}"
-MODEL_PATH="${MODEL_PATH:-models/Qwen2.5-Coder-7B-Instruct}"
+MODEL_PATH="${MODEL_PATH:-/mnt/nvme0n1/wenhao/models/Empirical-Influence-Function/Qwen2.5-Coder-7B-Instruct}"
 OUT_DIR="${OUT_DIR:-outputs/go_singleline_fim_exp/huawei_annotation}"
 RUN_DIR="${RUN_DIR:-runs/go_singleline_fim_exp/huawei_annotation}"
 VIS_OUT_DIR="${VIS_OUT_DIR:-outputs/huawei_deploy}"
@@ -263,7 +263,7 @@ visualize() {
   log "visualize compact=$compact"
   log "visualize csv=$csv"
   log "visualize html=$html"
-  python tools/viz_annotation/find_annotation_rich_samples.py \
+  python src/viz/viz_annotation/find_annotation_rich_samples.py \
     --raw_data_path "$CHATML_DATA" \
     --edge_data_path "$compact" \
     --model_path "$MODEL_PATH" \
@@ -271,7 +271,7 @@ visualize() {
     --sort_by total \
     --output_csv "$csv" \
     --local_files_only
-  python tools/viz_annotation/build_dynamic_annotation_viewer.py \
+  python src/viz/viz_annotation/build_dynamic_annotation_viewer.py \
     --edge_data_path "$compact" \
     --samples_csv "$csv" \
     --top_n_from_csv 50 \

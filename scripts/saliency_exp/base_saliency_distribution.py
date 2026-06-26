@@ -34,7 +34,7 @@ from dataset import AnnotatedSFTDataset, IGNORE_INDEX  # noqa: E402
 from loss import _unwrap_to_decoder_stack  # noqa: E402
 
 
-DEFAULT_MODEL = ROOT / "models/Qwen2.5-Coder-7B-Instruct"
+DEFAULT_MODEL = ROOT / "/mnt/nvme0n1/wenhao/models/Empirical-Influence-Function/Qwen2.5-Coder-7B-Instruct"
 DEFAULT_DATA = ROOT / "data/go_single/train_data/go_single_train_v2_graphsignal_500_compact.json"
 DEFAULT_OUT_DIR = ROOT / "outputs/saliency_exp/base_go_single_500_saliency_distribution"
 

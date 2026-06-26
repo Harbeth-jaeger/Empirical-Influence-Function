@@ -24,9 +24,9 @@ from scripts.go_singleline_fim_exp.go_single_pipeline import (  # noqa: E402
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build Go single-statement ChatML benchmarkV2 data.")
-    p.add_argument("--codesearchnet-dir", type=Path, default=Path("data/go_single/raw_data/codesearchnet/go/final/jsonl/unzip"))
+    p.add_argument("--codesearchnet-dir", type=Path, default=Path("/mnt/nvme0n1/wenhao/datasets/Empirical-Influence-Function/raw/codesearchnet/go/final/jsonl/unzip"))
     p.add_argument("--codesearchnet-glob", default="go_train_*.jsonl")
-    p.add_argument("--mceval-root", type=Path, default=Path("data/go_single/raw_data/mceval"))
+    p.add_argument("--mceval-root", type=Path, default=Path("/mnt/nvme0n1/wenhao/datasets/Empirical-Influence-Function/raw/mceval"))
     p.add_argument("--train-output", type=Path, default=Path("data/go_single/train_data/go_single_train_v2_canonical.jsonl"))
     p.add_argument("--train-chatml-output", type=Path, default=Path("data/go_single/train_data/go_single_train_v2_chatml.jsonl"))
     p.add_argument("--eval-output", type=Path, default=Path("data/go_single/eval_data/mceval_go_single_v2_canonical.jsonl"))

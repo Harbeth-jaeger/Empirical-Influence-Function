@@ -19,7 +19,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_DATA = ROOT / "data/benchmarks/sft_data/ours_graphsignal_train_first500.json"
+DEFAULT_DATA = ROOT / "/mnt/nvme0n1/wenhao/datasets/Empirical-Influence-Function/interim/benchmark_legacy_fim/sft_data/ours_graphsignal_train_first500.json"
 DEFAULT_OUTPUT = ROOT / "outputs/saliency_exp/selected_single_target.json"
 DEFAULT_MODEL = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
 IGNORE_INDEX = -100

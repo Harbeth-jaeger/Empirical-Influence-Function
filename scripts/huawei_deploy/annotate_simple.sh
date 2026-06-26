@@ -24,7 +24,7 @@ Common options:
   --hw-appkey KEY         Huawei X-HW-APPKEY.
   --hw-operator ID        Huawei operator/work-id.
   --workers N             Number of annotation workers. Default: 8.
-  --out-dir DIR           Prepared/compact output dir. Default: data/huawei_data/processed_full_clean.
+  --out-dir DIR           Prepared/compact output dir. Default: /mnt/nvme0n1/wenhao/datasets/Empirical-Influence-Function/interim/huawei_data/processed_full_clean.
   --run-dir DIR           Runtime/cache/log dir. Default: runs/huawei_deploy.
   --force-prepare         Rebuild prepared chatml/canonical data.
   --no-gofmt-filter       Disable gofmt full-code syntax quality filter.
@@ -141,7 +141,7 @@ export OPENAI_API_KEY="${OPENAI_API_KEY:-$HW_ID}"
 export MODEL_PATH="${MODEL_PATH:-/home/model_project/CCCodeGenerationTrain/infer_format/}"
 export ANNOTATE_MODEL="${ANNOTATE_MODEL:-fa6c020a-06e3-4a4f-8840-2951e5ef934d}"
 
-export HUAWEI_PROCESSED_DIR="${HUAWEI_PROCESSED_DIR:-data/huawei_data/processed_full_clean}"
+export HUAWEI_PROCESSED_DIR="${HUAWEI_PROCESSED_DIR:-/mnt/nvme0n1/wenhao/datasets/Empirical-Influence-Function/interim/huawei_data/processed_full_clean}"
 export OUT_DIR="${OUT_DIR:-$HUAWEI_PROCESSED_DIR}"
 export RUN_DIR="${RUN_DIR:-runs/huawei_deploy}"
 export VIS_OUT_DIR="${VIS_OUT_DIR:-outputs/huawei_deploy}"

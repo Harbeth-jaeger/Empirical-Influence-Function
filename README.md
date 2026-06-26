@@ -84,16 +84,38 @@ log C_positive - log C_negative >= margin
 
 | 路径 | 作用 |
 | ---- | ---- |
-| `src/` | 核心源码目录。当前主线包括 `src/annotate` 标注、`src/train` 训练、`src/attribution` 归因等。 |
-| `scripts/` | 可运行脚本目录。放数据处理、Go single-line FIM 流程、saliency 小实验、benchmark/baseline 相关脚本。 |
-| `tools/` | 可视化和人工检查工具目录，例如标注边、saliency、失败案例、prediction saliency viewer。 |
-| `data/` | 数据目录。`raw_data` 放原始拉取数据，`<lang>_<task>` 放处理后的同源任务数据，`benchmark` 放处理后的外部 benchmark 数据。 |
-| `models/` | 本地下载的基座模型目录，例如 Qwen / Code model 权重。原则上不放训练输出。 |
-| `outputs/` | 实验产物目录。放训练模型、评测结果、可视化页面、报告文档和 debug 中间产物。 |
-| `runs/` | 日志目录。长时间运行的训练、标注、数据处理、评测日志都放这里，便于 SSH 断连后复盘。 |
+| `src/` | 核心 Python 包。放可复用实现，不直接堆长命令脚本。 |
+| `src/annotate/` | 结构边与 LLM 语义边标注核心代码。 |
+| `src/data_process/` | FIM 数据 adapter、清洗、ChatML 构造、标注后处理等核心数据处理逻辑。 |
+| `src/train/` | saliency loss、训练器和训练相关核心模块。 |
+| `src/baseline/` | baseline 方法实现，例如 token/data filter 和 loss 类 baseline 的可复用逻辑。 |
+| `src/attribution/` | 数据归因、token/feature 归因相关实现。 |
+| `src/viz/` | 可视化和人工检查工具，例如标注边、saliency、失败案例、prediction saliency viewer。 |
+| `scripts/` | 可直接运行的入口脚本。一个功能尽量一个脚本，调用 `src/` 中的核心逻辑。 |
+| `scripts/data_process/` | 通用数据处理与标注 pipeline 入口。 |
+| `scripts/train/` | 训练入口脚本，例如 `train.sh`。 |
+| `scripts/baseline/` | baseline 数据构造、打分、过滤、训练入口。 |
+| `scripts/huawei_deploy/` | 华为侧部署用脚本，包含网关调用、华为数据 adapter、小样本检查和全量标注入口。 |
+| `configs/` | 实验、路径、训练和方法配置。 |
+| `data/` | 软链接，指向 `/mnt/nvme0n1/wenhao/datasets/Empirical-Influence-Function`。仓库内不实际保存大数据。 |
+| `models/` | 软链接，指向 `/mnt/nvme0n1/wenhao/models/Empirical-Influence-Function`。仓库内不实际保存模型权重。 |
+| `outputs/` | 仓库内实验产物、报告文档、可视化页面和 debug 中间产物。`outputs/runs/` 也是指向外部 runs 的软链接。 |
+| `runs/` | 软链接，指向 `/mnt/nvme0n1/wenhao/runs/Empirical-Influence-Function`。长任务日志写这里。 |
 | `README.md` | 项目入口说明。只保留高层路线和目录导航。 |
 | `AGENTS.md` | 协作/代码代理说明，记录项目约定、环境命令和安全边界。 |
-| `requirements.txt` | Python 依赖列表。 |
+| `requirements.txt` | 依赖入口；按场景拆分的手写依赖放在 `requirements/`。 |
+| `locks/` | 当前环境的冻结依赖，例如 `pip freeze` 结果，只用于复现实验环境。 |
+| `.env.example` | 本地路径、模型路径、API 和训练默认环境变量模板。真实密钥写 `.env`，不要提交。 |
+| `pyproject.toml` | Python 项目元数据和工具配置。 |
 | `.gitattributes` / `.gitignore` | Git 文件追踪和忽略规则。 |
 
-隐藏目录说明：`.git/` 是版本管理目录；`.vscode/` 是 IDE 配置；`.micromamba/`、`.local/`、`.venv/` 是本地运行环境，不属于算法流程本身。
+隐藏目录说明：`.git/` 是版本管理目录；`.vscode/` 是 IDE 配置。当前采用“仓库代码 + 外部大文件”的布局：数据、模型、长日志、HF cache 和 micromamba 环境默认放在 `/mnt/nvme0n1/wenhao/{datasets,models,runs,hf_cache,envs}`。仓库内的 `data/`、`models/`、`runs/`、`.micromamba/`、`outputs/runs/` 都是本地软链接入口，便于代码仍然使用短路径，同时避免把大文件提交到 Git。
+
+查看软链接本身用：
+
+```bash
+ls -ld data models runs outputs/runs .micromamba
+readlink data
+```
+
+注意 `ls data/` 会进入软链接目标目录，看起来像普通目录；确认是否为软链接要看 `ls -ld data` 第一列是否以 `l` 开头。

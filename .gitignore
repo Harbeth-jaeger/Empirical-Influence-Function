@@ -257,7 +257,9 @@ outputs/**/checkpoint-*/
 *.json
 *.html
 *.txt
-!requirements-annotate.txt
+!requirements.txt
+!requirements/*.txt
+!locks/*.txt
 *.csv
 
 # ==========================================
@@ -321,6 +323,7 @@ node_modules/
 # 4. 敏感信息
 # ==========================================
 .env
+.micromamba/
 *.env
 .pypirc
 
@@ -348,3 +351,10 @@ outputs/
 external/
 
 scripts/benchmark/official_evaluators
+
+# Local external-storage symlinks. Real paths live under /mnt/nvme0n1/wenhao/.
+/data
+/models
+/runs
+/.micromamba
+/outputs/runs

@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-DEFAULT_DATA = ROOT / "data/benchmarks/sft_data/ours_graphsignal_train_first500.json"
+DEFAULT_DATA = ROOT / "/mnt/nvme0n1/wenhao/datasets/Empirical-Influence-Function/interim/benchmark_legacy_fim/sft_data/ours_graphsignal_train_first500.json"
 DEFAULT_MODEL = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
 DEFAULT_RUN_DIR = ROOT / "runs/saliency_exp"
 IGNORE_INDEX = -100

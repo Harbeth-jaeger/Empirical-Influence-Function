@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from typing import Any
 
 from .common import (
@@ -13,8 +14,15 @@ from .common import (
 )
 
 
+def _valid_at(values: list[float | None], pos: int) -> float | None:
+    if pos >= len(values) or values[pos] is None:
+        return None
+    value = float(values[pos])
+    return value if math.isfinite(value) else None
+
+
 def iqr_low_threshold(values: list[float]) -> float | None:
-    finite = [float(v) for v in values if v == v]
+    finite = [float(v) for v in values if math.isfinite(float(v))]
     if len(finite) < 2:
         return None
     q1 = finite_percentile(finite, 25.0)
@@ -25,9 +33,9 @@ def iqr_low_threshold(values: list[float]) -> float | None:
 def xtf_noisy_positions(
     labels: list[int],
     *,
-    ri_scores: list[float] | None = None,
-    pcp_probs: list[float] | None = None,
-    tr_scores: list[float] | None = None,
+    ri_scores: list[float | None] | None = None,
+    pcp_probs: list[float | None] | None = None,
+    tr_scores: list[float | None] | None = None,
     pcp_threshold: float = 0.95,
     tr_percentile: float = 10.0,
     ignore_index: int = IGNORE_INDEX,
@@ -37,18 +45,24 @@ def xtf_noisy_positions(
     noisy: set[int] = set()
 
     if ri_scores:
-        ri_values = [float(ri_scores[pos]) for pos in supervised]
+        pairs = [(pos, _valid_at(ri_scores, pos)) for pos in supervised]
+        ri_values = [value for _, value in pairs if value is not None]
         threshold = iqr_low_threshold(ri_values)
         if threshold is not None:
-            noisy.update(pos for pos in supervised if float(ri_scores[pos]) < threshold)
+            noisy.update(pos for pos, value in pairs if value is not None and value < threshold)
 
     if pcp_probs:
-        noisy.update(pos for pos in supervised if float(pcp_probs[pos]) > pcp_threshold)
+        for pos in supervised:
+            value = _valid_at(pcp_probs, pos)
+            if value is not None and value > pcp_threshold:
+                noisy.add(pos)
 
     if tr_scores:
-        tr_values = [float(tr_scores[pos]) for pos in supervised]
-        threshold = finite_percentile(tr_values, tr_percentile)
-        noisy.update(pos for pos in supervised if float(tr_scores[pos]) < threshold)
+        pairs = [(pos, _valid_at(tr_scores, pos)) for pos in supervised]
+        tr_values = [value for _, value in pairs if value is not None]
+        if tr_values:
+            threshold = finite_percentile(tr_values, tr_percentile)
+            noisy.update(pos for pos, value in pairs if value is not None and value < threshold)
 
     return noisy
 
@@ -98,3 +112,71 @@ def apply_xtf_from_scores(
         "total_supervised_tokens": total_supervised,
     }
 
+
+def compute_xtf_score_rows(
+    samples: list[dict[str, Any]],
+    model: Any,
+    tokenizer: Any | None = None,
+    device: str | None = None,
+    ignore_index: int = IGNORE_INDEX,
+) -> list[dict[str, Any]]:
+    """Compute XTF RI/KN/TR scores aligned with each sample's label sequence."""
+    import torch
+    import torch.nn.functional as F
+
+    from .common import resolve_model_device, to_2d_long_tensor
+
+    runtime_device = resolve_model_device(model, device)
+    model.to(runtime_device).eval()
+    rows: list[dict[str, Any]] = []
+
+    with torch.no_grad():
+        for idx, sample in enumerate(samples):
+            uid = sample_uid(sample, fallback=str(idx))
+            input_ids = to_2d_long_tensor(sample["input_ids"], runtime_device)
+            labels = to_2d_long_tensor(labels_of(sample), runtime_device)
+            if tokenizer is not None and getattr(tokenizer, "pad_token_id", None) is not None:
+                attention_mask = input_ids.ne(int(tokenizer.pad_token_id)).long()
+            else:
+                attention_mask = torch.ones_like(input_ids)
+
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_attentions=True,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            length = labels.size(1)
+            label_list = labels[0].detach().cpu().tolist()
+            supervised = supervised_indices(label_list, ignore_index=ignore_index)
+            ri_scores: list[float | None] = [None] * length
+            pcp_probs: list[float | None] = [None] * length
+            tr_scores: list[float | None] = [None] * length
+
+            if supervised:
+                final_attn = outputs.attentions[-1].mean(dim=1)[0].float()
+                received = final_attn.sum(dim=0)
+                hidden = outputs.hidden_states[-1][0].float()
+                domain_vector = hidden[supervised].mean(dim=0, keepdim=True)
+                cosine = F.cosine_similarity(hidden, domain_vector, dim=-1)
+
+                probs = F.softmax(outputs.logits[..., :-1, :], dim=-1)
+                shift_labels = labels[..., 1:].contiguous()
+                valid = shift_labels.ne(ignore_index)
+                safe = shift_labels.masked_fill(~valid, 0)
+                gathered = probs.gather(-1, safe.unsqueeze(-1)).squeeze(-1)
+
+                for pos in supervised:
+                    ri_scores[pos] = float(received[pos].detach().cpu())
+                    tr_scores[pos] = float(cosine[pos].detach().cpu())
+                    if pos > 0:
+                        pcp_probs[pos] = float(gathered[0, pos - 1].detach().cpu())
+
+            rows.append({
+                "uid": uid,
+                "ri_scores": ri_scores,
+                "pcp_probs": pcp_probs,
+                "tr_scores": tr_scores,
+            })
+    return rows

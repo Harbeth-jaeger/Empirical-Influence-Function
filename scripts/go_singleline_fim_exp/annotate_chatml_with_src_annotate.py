@@ -904,7 +904,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Annotate ChatML Go-single data with src.annotate.AnnotatorAgent.")
     p.add_argument("--input_path", required=True)
     p.add_argument("--output_path", required=True)
-    p.add_argument("--model_name_or_path", default="models/Qwen2.5-Coder-7B-Instruct")
+    p.add_argument("--model_name_or_path", default="/mnt/nvme0n1/wenhao/models/Empirical-Influence-Function/Qwen2.5-Coder-7B-Instruct")
     p.add_argument("--model_max_length", type=int, default=4096)
     p.add_argument("--max_rows", type=int, default=0)
     p.add_argument("--num_workers", type=int, default=1)

@@ -77,11 +77,7 @@ def copy_with_masked_labels(
 
 
 def load_score_rows(path: str | Path) -> dict[str, dict[str, Any]]:
-    """Load score JSONL keyed by uid/task_id/id/sample_id.
-
-    Expected row shape is intentionally permissive, e.g.
-    {"uid": "...", "scores": [...]}, {"task_id": "...", "confidence": 0.9}.
-    """
+    """Load score JSONL keyed by uid/task_id/id/sample_id."""
     out: dict[str, dict[str, Any]] = {}
     for idx, row in enumerate(read_jsonl(path)):
         uid = sample_uid(row, fallback=str(idx))
@@ -119,6 +115,28 @@ def finite_percentile(values: list[float], percentile: float) -> float:
     return finite[lo] * (1.0 - frac) + finite[hi] * frac
 
 
+def to_2d_long_tensor(values: Any, device: Any = None):
+    import torch
+
+    tensor = torch.as_tensor(values, dtype=torch.long, device=device)
+    if tensor.dim() == 1:
+        tensor = tensor.unsqueeze(0)
+    if tensor.dim() != 2:
+        raise ValueError(f"expected 1D/2D token tensor, got shape={tuple(tensor.shape)}")
+    return tensor
+
+
+def resolve_model_device(model: Any, explicit_device: str | None = None):
+    import torch
+
+    if explicit_device:
+        return torch.device(explicit_device)
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 def extract_code_block_or_raw(text: str) -> str:
     blocks = re.findall(r"```(?:[A-Za-z0-9_+#.-]+)?\n(.*?)```", text, flags=re.DOTALL)
     if blocks:
@@ -135,4 +153,3 @@ def replace_response_fields(sample: dict[str, Any], response: str) -> dict[str, 
         if isinstance(msg, dict) and msg.get("role") == "assistant":
             msg["content"] = response
     return local
-

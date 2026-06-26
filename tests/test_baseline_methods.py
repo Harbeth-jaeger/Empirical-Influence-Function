@@ -80,3 +80,56 @@ def test_ibft_loss_shapes():
     out = compute_ibft_loss(hidden_states=hidden, labels=labels, lm_head=lm_head, bottleneck=bottleneck)
     assert out.num_tokens == 3
     assert out.loss.ndim == 0
+
+
+class _FakeScoreOutput:
+    def __init__(self, logits, attentions=None, hidden_states=None):
+        self.logits = logits
+        self.attentions = attentions
+        self.hidden_states = hidden_states
+
+
+class _FakeScoreModel(torch.nn.Module):
+    def __init__(self, vocab_size=16, bias=0.0):
+        super().__init__()
+        self.dummy = torch.nn.Parameter(torch.zeros(()))
+        self.vocab_size = vocab_size
+        self.bias = bias
+
+    def forward(self, input_ids, attention_mask=None, output_attentions=False, output_hidden_states=False, return_dict=True):
+        batch, length = input_ids.shape
+        logits = torch.zeros(batch, length, self.vocab_size, device=input_ids.device)
+        logits[..., 3] = self.bias
+        logits[..., 4] = self.bias / 2
+        logits[..., 5] = self.bias / 3
+        attentions = None
+        hidden_states = None
+        if output_attentions:
+            base = torch.ones(batch, 1, length, length, device=input_ids.device)
+            base = torch.tril(base)
+            attentions = (base / base.sum(dim=-1, keepdim=True).clamp_min(1),)
+        if output_hidden_states:
+            hidden = torch.nn.functional.one_hot(input_ids.clamp_max(7), num_classes=8).float()
+            hidden_states = (hidden,)
+        return _FakeScoreOutput(logits, attentions=attentions, hidden_states=hidden_states)
+
+
+def test_token_cleaning_score_generation_with_fake_models():
+    from src.baseline.token_cleaning import compute_token_cleaning_score_rows
+
+    rows = compute_token_cleaning_score_rows([_sample()], _FakeScoreModel(bias=0.0), _FakeScoreModel(bias=2.0))
+    assert rows[0]["uid"] == "s1"
+    assert len(rows[0]["scores"]) == 5
+    assert rows[0]["scores"][2] is not None
+    assert rows[0]["scores"][0] is None
+
+
+def test_xtf_score_generation_with_fake_model():
+    from src.baseline.xtf import compute_xtf_score_rows
+
+    rows = compute_xtf_score_rows([_sample()], _FakeScoreModel(bias=1.0))
+    assert rows[0]["uid"] == "s1"
+    assert len(rows[0]["ri_scores"]) == 5
+    assert rows[0]["ri_scores"][2] is not None
+    assert rows[0]["pcp_probs"][2] is not None
+    assert rows[0]["tr_scores"][2] is not None
