@@ -10,12 +10,6 @@ from torch import Tensor
 
 logger = logging.getLogger(__name__)
 
-def _unwrap_module(m):
-    while hasattr(m, "module"):
-        m = m.module
-    return m
-
-
 
 def _unwrap_to_decoder_stack(model):
     """
@@ -40,21 +34,23 @@ def _unwrap_to_decoder_stack(model):
 
 def build_contribution_matrix(
     model,
-    last_hidden_in: Tensor,   # [B, T, D]   input to the last decoder layer
+    last_hidden_in: Tensor,   # [B, T, D]   input to the selected decoder layer
     attn_probs: Tensor,       # [B, H, T, T] Step 1
+    *,
+    layer_index: int = -1,
 ) -> Tensor:
     """
-        Strict Kobayashi/ALTI contribution c_{i,j} = ||T_i(x_j)||_2 for the last layer.
+        Strict Kobayashi/ALTI contribution c_{i,j} = ||T_i(x_j)||_2 for the
+        decoder layer ``layer_index`` (default -1 = last layer).
     """
     decoder = _unwrap_to_decoder_stack(model)
-    layer = _unwrap_module(decoder.layers[-1]) # last decoder block
+    layer = decoder.layers[layer_index] # selected decoder block
     self_attn = layer.self_attn
 
     B, T, D = last_hidden_in.shape
     H = attn_probs.size(1)
     device = last_hidden_in.device
     dtype = last_hidden_in.dtype
-    compute_dtype = dtype if dtype in (torch.float16, torch.bfloat16) else torch.float32
 
     head_dim = getattr(self_attn, "head_dim", None) or (
         self_attn.q_proj.weight.shape[0] // H
@@ -405,7 +401,9 @@ def build_contribution_rows(
     row_batch: Tensor,        # [Q]
     row_qry: Tensor,          # [Q]
     *,
+    layer_index: int = -1,
     source_chunk_size: int = 16,
+    query_chunk_size: int = 64,
 ) -> Tensor:
     """Compute only selected query rows C[b, q, :] of the contribution matrix.
 
@@ -413,16 +411,31 @@ def build_contribution_rows(
     build_contribution_matrix(...), but avoids materializing the full
     [B, T, T, D] contribution tensor. It is the training path for the
     InfoNCE saliency loss.
+
+    Memory optimizations vs. the original implementation:
+      * **B==1 fast path**: when there is a single example in the batch,
+        ``transformed`` is sliced as ``[H, S, D]`` instead of ``[Q, H, S, D]``,
+        avoiding the Q-fold duplication that previously dominated activation
+        memory (Q can be 200+ on long sequences with dense annotation).
+      * **query chunking**: outer loop over query batches of size
+        ``query_chunk_size`` so the peak ``[Q, H, S, D]`` chunk for B>1
+        becomes ``[Qc, H, S, D]``. Mathematically identical to the original
+        single-pass implementation (each query row is independent in the
+        einsum).
+
+    ``layer_index`` selects which decoder block's attention/value path is used
+    (default -1 = last layer). The caller must pass the matching
+    ``attn_probs`` (= outputs.attentions[layer_index]) and ``last_hidden_in``
+    (= input to that layer = outputs.hidden_states[layer_index]).
     """
     decoder = _unwrap_to_decoder_stack(model)
-    layer = _unwrap_module(decoder.layers[-1])
+    layer = decoder.layers[layer_index]
     self_attn = layer.self_attn
 
     B, T, D = last_hidden_in.shape
     H = attn_probs.size(1)
     device = last_hidden_in.device
     dtype = last_hidden_in.dtype
-    compute_dtype = dtype if dtype in (torch.float16, torch.bfloat16) else torch.float32
 
     head_dim = getattr(self_attn, "head_dim", None) or (
         self_attn.q_proj.weight.shape[0] // H
@@ -432,13 +445,13 @@ def build_contribution_rows(
     assert H % num_kv_heads == 0, f"H={H} not divisible by num_kv_heads={num_kv_heads}"
     n_rep = H // num_kv_heads
 
-    gamma = layer.input_layernorm.weight.to(device=device, dtype=compute_dtype)
-    gamma_x = last_hidden_in.to(compute_dtype) * gamma
-    v_w = self_attn.v_proj.weight.to(device=device, dtype=compute_dtype)
+    gamma = layer.input_layernorm.weight.to(device).float()
+    gamma_x = last_hidden_in.float() * gamma
+    v_w = self_attn.v_proj.weight.to(device).float()
     v_b = self_attn.v_proj.bias
     v_proj = gamma_x @ v_w.t()
     if v_b is not None:
-        v_proj = v_proj + v_b.to(device=device, dtype=compute_dtype)
+        v_proj = v_proj + v_b.to(device).float()
     v_states = v_proj.view(B, T, num_kv_heads, head_dim).permute(0, 2, 1, 3)
     if n_rep > 1:
         v_states = (
@@ -447,8 +460,9 @@ def build_contribution_rows(
             .reshape(B, H, T, head_dim)
         )
 
-    o_w = self_attn.o_proj.weight.to(device=device, dtype=compute_dtype)
+    o_w = self_attn.o_proj.weight.to(device).float()
     o_w_by_head = o_w.view(D, H, head_dim)
+    transformed = torch.einsum("bhsd,ohd->bhso", v_states, o_w_by_head)
 
     row_batch = row_batch.to(device=device, dtype=torch.long)
     row_qry = row_qry.to(device=device, dtype=torch.long)
@@ -457,37 +471,54 @@ def build_contribution_rows(
         return torch.empty((0, T), device=device, dtype=dtype)
 
     eps_rms = getattr(layer.input_layernorm, "variance_epsilon", 1e-6)
-    query_hidden_f = last_hidden_in.float()[row_batch, row_qry, :]     # [Q, D]
-    query_hidden = last_hidden_in.to(compute_dtype)[row_batch, row_qry, :]
-    sigma_q = query_hidden_f.pow(2).mean(dim=-1).add(eps_rms).sqrt().clamp_min(1e-12)
+    query_hidden_all = last_hidden_in.float()[row_batch, row_qry, :]   # [Q, D]
+    sigma_q_all = (
+        query_hidden_all.pow(2).mean(dim=-1).add(eps_rms).sqrt().clamp_min(1e-12)
+    )
 
-    attn_f = attn_probs.to(compute_dtype)
-    chunks = []
-    for start in range(0, T, source_chunk_size):
-        stop = min(start + source_chunk_size, T)
-        attn_chunk = attn_f[row_batch, :, row_qry, start:stop]         # [Q, H, S]
-        S = stop - start
-        contrib = torch.zeros((Q, S, D), device=device, dtype=compute_dtype)
-        # Keep the [Q, H, S, D] transformed value projection from becoming
-        # the peak allocation on dense annotation batches.
-        head_chunk_size = 1
-        for h_start in range(0, H, head_chunk_size):
-            h_stop = min(h_start + head_chunk_size, H)
-            attn_part = attn_chunk[:, h_start:h_stop, :]               # [Q, h, S]
-            v_part = v_states[row_batch, h_start:h_stop, start:stop, :] # [Q, h, S, head_dim]
-            o_part = o_w_by_head[:, h_start:h_stop, :]                 # [D, h, head_dim]
-            transformed_part = torch.einsum("qhsd,ohd->qhso", v_part, o_part)
-            contrib = contrib + torch.einsum("qhs,qhso->qso", attn_part, transformed_part)
+    attn_f = attn_probs.float()
 
-        diag_mask = (row_qry >= start) & (row_qry < stop)
-        if bool(diag_mask.any()):
-            local = row_qry[diag_mask] - start
-            contrib[diag_mask, local, :] = contrib[diag_mask, local, :] + query_hidden[diag_mask]
+    # B==1 fast path: drop the Q-fold gather along the batch axis.
+    single_example = (B == 1)
+    if single_example:
+        transformed_b0 = transformed[0]   # [H, T, D]
+        attn_b0 = attn_f[0]               # [H, T, T]
 
-        contrib = contrib / sigma_q.to(compute_dtype).view(Q, 1, 1)
-        chunks.append(contrib.float().norm(dim=-1, p=2).to(dtype))
+    out = torch.empty((Q, T), device=device, dtype=dtype)
+    qchunk = max(1, int(query_chunk_size))
+    for q_start in range(0, Q, qchunk):
+        q_end = min(q_start + qchunk, Q)
+        rb = row_batch[q_start:q_end]
+        rq = row_qry[q_start:q_end]
+        Qc = rq.numel()
+        query_hidden = query_hidden_all[q_start:q_end]
+        sigma_q = sigma_q_all[q_start:q_end]
 
-    return torch.cat(chunks, dim=1)
+        chunks: list[Tensor] = []
+        for start in range(0, T, source_chunk_size):
+            stop = min(start + source_chunk_size, T)
+            if single_example:
+                # [Qc, H, S]
+                attn_chunk = attn_b0[:, rq, start:stop].permute(1, 0, 2).contiguous()
+                # [H, S, D] -> einsum without Q-fold duplication
+                transformed_chunk = transformed_b0[:, start:stop, :]
+                contrib = torch.einsum("qhs,hso->qso", attn_chunk, transformed_chunk)
+            else:
+                attn_chunk = attn_f[rb, :, rq, start:stop]                # [Qc, H, S]
+                transformed_chunk = transformed[rb, :, start:stop, :]     # [Qc, H, S, D]
+                contrib = torch.einsum("qhs,qhso->qso", attn_chunk, transformed_chunk)
+
+            diag_mask = (rq >= start) & (rq < stop)
+            if bool(diag_mask.any()):
+                local = rq[diag_mask] - start
+                contrib[diag_mask, local, :] = contrib[diag_mask, local, :] + query_hidden[diag_mask]
+
+            contrib = contrib / sigma_q.view(Qc, 1, 1)
+            chunks.append(contrib.norm(dim=-1, p=2).to(dtype))
+
+        out[q_start:q_end] = torch.cat(chunks, dim=1)
+
+    return out
 
 
 def _annotation_rows_from_pairs(
@@ -641,6 +672,7 @@ def compute_saliency_loss_from_rows(
     neg_weight: float = 0.5,      # multiplier on the negative-side mean penalty
     neg_hard_only: bool = False,  # if True, average only over negatives with r > margin_minus
     neg_sample_k: int = 0,        # if >0, randomly subsample this many negatives per query for softmax/softmax_margin (MoCo-style)
+    exclude_source_rows: Tensor | None = None,  # [Q, T] bool/float, 1 = drop this source from the NEGATIVE set (sink / special tokens)
 ) -> SaliencyDiagnostics:
     """Saliency objective with C already row-gathered."""
     Q, T = C_rows.shape
@@ -671,6 +703,14 @@ def compute_saliency_loss_from_rows(
     annot_mask = M_causal * A_adj_bin
     non_annot_mask = M_causal * (1.0 - A_adj_bin)
 
+    # Drop sink / special-token sources from the NEGATIVE set so the loss never
+    # pushes down the attention sink (a load-bearing no-op valve, per Gu/Pang
+    # 2025, Barbero 2025). Positives are untouched — annotation edges never
+    # point at sink/special tokens.
+    if exclude_source_rows is not None:
+        keep_src = (1.0 - exclude_source_rows.to(device=device, dtype=dtype)).clamp_(0.0, 1.0)
+        non_annot_mask = non_annot_mask * keep_src
+
     den_C = annot_mask.sum(dim=-1).clamp_min(eps)
     den_N = non_annot_mask.sum(dim=-1).clamp_min(eps)
     C_bar = (annot_mask * C_rows).sum(dim=-1) / den_C
@@ -695,14 +735,14 @@ def compute_saliency_loss_from_rows(
 
     # Optional MoCo-style negative subsampling for softmax / softmax_margin.
     # For each query, keep at most `neg_sample_k` randomly-chosen negatives
-    # active inside the saliency loss. Positives and the non-causal mask
+    # active inside the softmax denominator. Positives and the non-causal mask
     # are untouched. Sampling weights are uniform over current negatives so
     # every above-floor negative has an equal expected gradient share, breaking
     # the InfoNCE winner-takes-all bias. Across steps the iid resampling covers
     # the full N_q (MoCo / SimCLR style).
     if (
         int(neg_sample_k) > 0
-        and loss_kind in ("softmax", "softmax_margin", "ranknet", "contrastive")
+        and loss_kind in ("softmax", "softmax_margin")
         and nonannot_I.size(0) > 0
     ):
         k = int(neg_sample_k)
@@ -861,21 +901,70 @@ def compute_saliency_loss_from_rows(
         tau = max(float(alpha), eps_f)
         margin = float(margin_plus)
         scores = torch.log(C_rows_I.float() + eps_f)         # [Qi, T]
-        Qi_ = scores.shape[0]
-        per_q = []
-        for q in range(Qi_):
-            p_idx = annot_I[q].bool().nonzero(as_tuple=True)[0]
-            n_idx = nonannot_I[q].bool().nonzero(as_tuple=True)[0]
-            if p_idx.numel() == 0 or n_idx.numel() == 0:
-                continue
-            pos = scores[q, p_idx]
-            neg = scores[q, n_idx]
-            diff = (neg.unsqueeze(0) - pos.unsqueeze(1)) / tau  # [|A|, |N|]
-            per_q.append(F.relu(margin + diff).mean())
-        if per_q:
-            loss = torch.stack(per_q).mean().to(dtype)
+        Qi_, T_ = scores.shape
+        k_neg = int(neg_sample_k) if neg_sample_k else 0
+
+        annot_b = annot_I.bool()      # [Qi, T]
+        nonannot_b = nonannot_I.bool()  # [Qi, T]
+
+        # Optional uniform-random per-query subsampling of negatives. We
+        # implement randperm-equivalence via topk of uniform noise restricted
+        # to the negative mask; queries with |N_q| <= k_neg keep the full mask.
+        if k_neg > 0:
+            n_per_q = nonannot_b.sum(dim=-1)              # [Qi]
+            need_sub = n_per_q > k_neg
+            if bool(need_sub.any()):
+                rand = torch.rand(nonannot_b.shape, device=scores.device, dtype=torch.float32)
+                rand = rand.masked_fill(~nonannot_b, -1.0)
+                # topk along dim=-1; for rows with <k_neg negatives we still
+                # take k_neg indices (some may be -1.0 = non-neg), so we mask
+                # those out by intersecting with original nonannot_b below.
+                k_take = min(k_neg, T_)
+                _, top_idx = rand.topk(k_take, dim=-1)    # [Qi, k_take]
+                sub_mask = torch.zeros_like(nonannot_b)
+                sub_mask.scatter_(1, top_idx, True)
+                sub_mask &= nonannot_b                    # keep only real negs
+                # for queries with n_per_q <= k_neg, keep the full set
+                neg_mask = torch.where(need_sub.unsqueeze(-1), sub_mask, nonannot_b)
+            else:
+                neg_mask = nonannot_b
         else:
-            loss = torch.zeros((), device=device, dtype=dtype)
+            neg_mask = nonannot_b
+
+        # Vectorized pair hinge. pair[q,i,j] = relu(margin + (scores[q,j] -
+        # scores[q,i]) / tau) for positive i, negative j. Memory ~ Qi*T*T*4
+        # bytes; with typical Qi=30, T=120 this is ~1.7MB, so we use a single
+        # guard to fall back to the loop if a future config blows past 256MB.
+        bytes_needed = Qi_ * T_ * T_ * 4
+        if bytes_needed > 256 * 1024 * 1024:  # 256MB safety
+            per_q = []
+            for q in range(Qi_):
+                p_idx = annot_b[q].nonzero(as_tuple=True)[0]
+                n_idx = neg_mask[q].nonzero(as_tuple=True)[0]
+                if p_idx.numel() == 0 or n_idx.numel() == 0:
+                    continue
+                pos = scores[q, p_idx]
+                neg = scores[q, n_idx]
+                diff = (neg.unsqueeze(0) - pos.unsqueeze(1)) / tau
+                per_q.append(F.relu(margin + diff).mean())
+            if per_q:
+                loss = torch.stack(per_q).mean().to(dtype)
+            else:
+                loss = torch.zeros((), device=device, dtype=dtype)
+        else:
+            # [Qi, T_pos=T, T_neg=T] pair difference
+            diff = (scores.unsqueeze(1) - scores.unsqueeze(2)) / tau  # diff[q,i,j] = (s[q,j]-s[q,i])/tau
+            pair_loss = F.relu(margin + diff)                          # [Qi, T, T]
+            pair_mask = annot_b.unsqueeze(2) & neg_mask.unsqueeze(1)   # [Qi, T_pos, T_neg]
+            pair_mask_f = pair_mask.to(pair_loss.dtype)
+            n_pairs_per_q = pair_mask_f.sum(dim=(1, 2))                # [Qi]
+            sum_loss_per_q = (pair_loss * pair_mask_f).sum(dim=(1, 2))  # [Qi]
+            valid_q = n_pairs_per_q > 0
+            if bool(valid_q.any()):
+                per_q_mean = sum_loss_per_q[valid_q] / n_pairs_per_q[valid_q].clamp_min(1.0)
+                loss = per_q_mean.mean().to(dtype)
+            else:
+                loss = torch.zeros((), device=device, dtype=dtype)
         diag_floor_mode = "contrastive"
         floor_eps_kind = "pair_hinge"
         effective_floor_eps = 0.0
@@ -911,6 +1000,8 @@ def saliency_loss_from_outputs(
         outputs,  # HF output with attentions + hidden_states
         annot_pairs: list[Tensor] | Tensor,  # flat [B, 3] or list of [Number of pairs, 2]
         *,
+        saliency_layer: int = -1,
+        exclude_source_mask: Tensor | None = None,
         alpha: float = 1.5,
         eps: float = 1e-8,
         floor_eps: float = 0.0,
@@ -929,7 +1020,6 @@ def saliency_loss_from_outputs(
         neg_weight: float = 0.5,
         neg_hard_only: bool = False,
         neg_sample_k: int = 0,
-        source_chunk_size: int = 16,
 ) -> SaliencyDiagnostics:
     """
     Takes the model's forward output and produces the saliency diagnostics in one call.
@@ -938,20 +1028,15 @@ def saliency_loss_from_outputs(
     `annot_pairs` may be either a flat [B, 3] tensor (batch_idx, pos_a, pos_b)
     or a list of [Number of pairs, 2] tensors.
     """
-    attn_last = outputs.attentions[-1]
-    assert attn_last is not None, "outputs.attentions[-1] is None — switch to eager attention."
+    n_layers = len(outputs.attentions)
+    li = int(saliency_layer) if int(saliency_layer) >= 0 else n_layers + int(saliency_layer)
+    li = max(0, min(li, n_layers - 1))
+    attn_sel = outputs.attentions[li]
+    assert attn_sel is not None, "outputs.attentions[...] is None — switch to eager attention."
 
-    # hidden_states tuple: [embedding_out, layer_1_out, ..., layer_L_out]
-    # input to the last decoder layer = hidden_states[-2]
-    last_hidden_in = outputs.hidden_states[-2]  # [B, T, D]
-    # The saliency objective only needs the last-layer attention and the input
-    # to the final decoder block. Keeping every layer hidden/attention alive
-    # can add several GiB of peak memory before contribution rows are built.
-    try:
-        outputs.attentions = (attn_last,)
-        outputs.hidden_states = (last_hidden_in,)
-    except Exception:
-        pass
+    # hidden_states tuple: [embedding_out, layer_0_out, ..., layer_{L-1}_out];
+    # the input to decoder layer ``li`` is hidden_states[li].
+    last_hidden_in = outputs.hidden_states[li]  # [B, T, D]
 
     B, T, _ = last_hidden_in.shape
     row_batch, row_qry, src_all, inv = _annotation_rows_from_pairs(
@@ -973,17 +1058,22 @@ def saliency_loss_from_outputs(
     C_rows = build_contribution_rows(
         model,
         last_hidden_in,
-        attn_last,
+        attn_sel,
         row_batch,
         row_qry,
-        source_chunk_size=max(1, int(source_chunk_size)),
+        layer_index=li,
     )
+    exclude_rows = None
+    if exclude_source_mask is not None:
+        em = exclude_source_mask.to(device=C_rows.device)
+        exclude_rows = em[row_batch.to(C_rows.device)]
     return compute_saliency_loss_from_rows(
         C_rows,
         row_batch,
         row_qry,
         src_all,
         inv,
+        exclude_source_rows=exclude_rows,
         alpha=alpha,
         eps=eps,
         floor_eps=floor_eps,
@@ -1003,3 +1093,520 @@ def saliency_loss_from_outputs(
         neg_hard_only=neg_hard_only,
         neg_sample_k=neg_sample_k,
     )
+
+
+# ── Counterfactual shortcut-masking augmentation ──────────────────────────────
+# Alternative to the saliency loss. Instead of forcing an attribution metric
+# (ALTI mAP) to match annotations — which we showed only reshapes last-layer
+# attention weights without changing the prediction (Goodhart) — we corrupt the
+# putative *shortcut* tokens (non-annotated prefix tokens) and keep training with
+# CE on the real target. Because the loss is on behaviour (P(target | corrupted
+# input)) rather than on a proxy, any reduction means the model genuinely routes
+# information from the surviving annotated tokens to the output.
+#
+# Corruption = attention-masking (set selected key positions unattendable). This
+# keeps every other token's RoPE/positions intact and stays in-distribution (no
+# novel [MASK] token).
+
+IGNORE_INDEX = -100
+
+
+@dataclass
+class ShortcutMaskStats:
+    masked_attention_mask: Tensor  # [B, T] — 0 at padding + masked shortcut keys
+    n_masked: float                # avg #positions masked per sample
+    n_candidates: float            # avg #maskable (non-annotated) positions per sample
+    frac_masked: float             # n_masked / n_candidates over the batch
+
+
+def build_shortcut_mask(
+    input_ids: Tensor,                       # [B, T]
+    labels: Tensor,                          # [B, T]  (IGNORE_INDEX on context)
+    attention_mask: Tensor,                  # [B, T]  (0 = padding)
+    annot_pairs_batch: "list[Tensor]",       # per-sample [N, 2] (src, dst) positions
+    *,
+    rate: float = 0.3,
+    max_k: int = 0,
+    min_k: int = 0,
+    recency_window: int = 8,
+    protect_prefix: int = 0,
+    special_ids: Tensor | None = None,
+    ignore_index: int = IGNORE_INDEX,
+    generator: torch.Generator | None = None,
+    node_weight_batch: Tensor | None = None,  # [B, T] weight-to-target in [0,1]
+    weight_aware: bool = False,
+    p_max: float = 0.9,
+    p_gamma: float = 1.0,
+) -> ShortcutMaskStats:
+    """Build a [B, T] attention mask that additionally hides a random subset of
+    *non-annotated* context tokens (putative shortcuts) as attention KEYS.
+
+    A context position p is *maskable* iff:
+      - it is real (attention_mask == 1) and part of the prompt (labels == ignore);
+      - it does NOT appear in any annotation edge (neither src nor dst);
+      - it is not a special/role token (when ``special_ids`` is given);
+      - it is not inside the first ``protect_prefix`` positions (chat/system header
+        + attention sink), nor inside the ``recency_window`` immediately before the
+        first target token (local syntax is a genuine dependency, never a shortcut).
+
+    Per sample we mask k = clip(round(rate * n_candidates), min_k, max_k) of the
+    maskable positions, chosen uniformly at random. k=0 (or no target) leaves the
+    sample's mask untouched → that sample trains as ordinary CE.
+
+    **Weight-aware mode** (``weight_aware=True`` and ``node_weight_batch`` given):
+    instead of masking a fixed fraction uniformly, each maskable position is masked
+    independently with probability ``p_max * (1 - w)^p_gamma`` where ``w`` is the
+    position's augmented-edge weight into any target token (``node_weight``). So a
+    first-order source (``w=1``) is never masked, an unrelated token (``w=0``) is
+    masked with probability ``p_max`` (the highest, but < 1), and transitively
+    related tokens fall in between (lower weight → higher mask probability). In this
+    mode annotated endpoints are NOT blanket-protected — relevance to the *target*
+    (not membership in any edge) decides masking — and ``rate``/``min_k``/``max_k``
+    are ignored. ``special_ids``, ``protect_prefix`` and ``recency_window`` still
+    apply, and position 0 is always kept (sink / softmax safety).
+    """
+    device = input_ids.device
+    B, T = input_ids.shape
+    masked = attention_mask.clone()
+    if special_ids is not None and special_ids.numel() > 0:
+        special_ids = special_ids.to(device)
+    use_wa = bool(weight_aware) and node_weight_batch is not None
+    if use_wa:
+        node_weight_batch = node_weight_batch.to(device)
+
+    tot_masked = 0
+    tot_cand = 0
+    for b in range(B):
+        valid = attention_mask[b].bool()
+        is_ctx = labels[b].eq(ignore_index)
+        cand = valid & is_ctx
+
+        # Never mask position 0 (BOS / attention sink): if its key were hidden,
+        # the query-0 row would be all -inf under the causal mask → softmax NaN.
+        # Keeping it available also respects the load-bearing attention-sink role.
+        cand[0] = False
+
+        # Protect annotated positions (both endpoints of every edge). Skipped in
+        # weight-aware mode, where node_weight (relevance to the target) — not
+        # membership in any edge — governs masking, so transitively related
+        # endpoints stay maskable with a low probability.
+        if not use_wa:
+            pairs = annot_pairs_batch[b] if b < len(annot_pairs_batch) else None
+            if pairs is not None and pairs.numel() > 0:
+                p = pairs.to(device).view(-1)
+                p = p[(p >= 0) & (p < T)]
+                if p.numel() > 0:
+                    cand[p] = False
+
+        # Protect special / role tokens.
+        if special_ids is not None and special_ids.numel() > 0:
+            cand &= ~torch.isin(input_ids[b], special_ids)
+
+        # Protect the leading header / attention-sink prefix.
+        if protect_prefix > 0:
+            cand[: min(protect_prefix, T)] = False
+
+        # Protect the recency window just before the first target token.
+        tgt_pos = (~is_ctx & valid).nonzero(as_tuple=False).flatten()
+        if tgt_pos.numel() > 0 and recency_window > 0:
+            j0 = int(tgt_pos[0].item())
+            lo = max(0, j0 - recency_window)
+            cand[lo:j0] = False
+
+        cand_idx = cand.nonzero(as_tuple=False).flatten()
+        n_cand = int(cand_idx.numel())
+        tot_cand += n_cand
+        if n_cand == 0:
+            continue
+
+        if use_wa:
+            # Per-token Bernoulli: p_mask = p_max * (1 - w)^gamma.
+            w = node_weight_batch[b, cand_idx].clamp(0.0, 1.0)
+            p_mask = p_max * (1.0 - w).pow(p_gamma)
+            r = (torch.rand(n_cand, generator=generator, device=device)
+                 if generator is not None else torch.rand(n_cand, device=device))
+            chosen = cand_idx[r < p_mask]
+            if chosen.numel() > 0:
+                masked[b, chosen] = 0
+            tot_masked += int(chosen.numel())
+            continue
+
+        k = int(round(rate * n_cand))
+        if min_k > 0:
+            k = max(k, min_k)
+        if max_k > 0:
+            k = min(k, max_k)
+        k = max(0, min(k, n_cand))
+        if k == 0:
+            continue
+
+        perm = torch.randperm(n_cand, generator=generator, device=device)[:k]
+        chosen = cand_idx[perm]
+        masked[b, chosen] = 0
+        tot_masked += k
+
+    return ShortcutMaskStats(
+        masked_attention_mask=masked,
+        n_masked=tot_masked / max(1, B),
+        n_candidates=tot_cand / max(1, B),
+        frac_masked=(tot_masked / tot_cand) if tot_cand > 0 else 0.0,
+    )
+
+
+@dataclass
+class PerTargetMaskStats:
+    allow: Tensor          # [B, 1, T, T] bool — True = key visible to that query
+    n_masked: float
+    n_candidates: float
+    frac_masked: float
+
+
+def build_shortcut_mask_per_target(
+    input_ids: Tensor,                  # [B, T]
+    labels: Tensor,                     # [B, T]
+    attention_mask: Tensor,             # [B, T]
+    annot_pairs_batch: "list[Tensor]",  # per-sample [N, 2] (src, dst)
+    *,
+    annot_weights_batch: "list[Tensor] | None" = None,  # per-sample [N] edge weights
+    rate: float = 0.3,
+    recency_window: int = 8,
+    protect_prefix: int = 0,
+    special_ids: Tensor | None = None,
+    ignore_index: int = IGNORE_INDEX,
+    generator: torch.Generator | None = None,
+    weight_aware: bool = False,
+    p_max: float = 0.9,
+    p_gamma: float = 1.0,
+) -> PerTargetMaskStats:
+    """Per-target shortcut mask: a 2-D [T_q, T_k] visibility map per sample.
+
+    Unlike :func:`build_shortcut_mask` (one global key mask for all queries),
+    this hides a *different* set of keys for each target query row. For each
+    target position q (``labels[q] != ignore`` — an annotated dst), only that
+    target's own non-annotation context keys are maskable; every other query row
+    keeps the plain causal mask. Returns a boolean ``allow[B, 1, T, T]`` (True =
+    visible) that the trainer converts into an additive attention bias.
+
+    The source set of target q is ``S_q = {i : (i, q) is an (augmented) edge}``.
+    A key k (context, ``k < q``, not special / prefix / recency, ``k != 0``) is
+    maskable for row q:
+      - uniform      : mask ``round(rate * |candidates|)`` of them at random.
+      - weight_aware : mask each with prob ``p_max * (1 - w)^gamma`` where
+                       ``w = weight(k -> q)`` is the *per-target* edge weight
+                       (first-order ``w=1`` never masked, unconnected ``w=0``
+                       masked at ``p_max``).
+    Because the source/weight set is per-target, this responds to edge
+    augmentation even in the uniform case (denser per-target sources), unlike the
+    global mask whose protected node set is augmentation-invariant.
+
+    Position 0 and q itself stay visible (causal-softmax / NaN safety).
+    Convention: q is the target token's own position (dst), matching the saliency
+    framework C[q=dst, s=src]; masking row q shapes that target token's
+    representation.
+    """
+    device = input_ids.device
+    B, T = input_ids.shape
+    causal = torch.tril(torch.ones(T, T, dtype=torch.bool, device=device))
+    allow = torch.zeros(B, 1, T, T, dtype=torch.bool, device=device)
+    if special_ids is not None and special_ids.numel() > 0:
+        special_ids = special_ids.to(device)
+
+    tot_masked = 0
+    tot_cand = 0
+    for b in range(B):
+        valid_key = attention_mask[b].bool()                 # [T]
+        is_ctx = labels[b].eq(ignore_index)
+        a = causal & valid_key.unsqueeze(0)                  # [T, T] (q, k): k<=q & key valid
+        a = a.clone()
+
+        # dst -> {src: max weight} from the (augmented) edges.
+        src_of: dict[int, dict[int, float]] = {}
+        pairs = annot_pairs_batch[b] if b < len(annot_pairs_batch) else None
+        if pairs is not None and pairs.numel() > 0:
+            pl = pairs.tolist()
+            wl = None
+            if (annot_weights_batch is not None and b < len(annot_weights_batch)
+                    and annot_weights_batch[b] is not None
+                    and annot_weights_batch[b].numel() == len(pl)):
+                wl = annot_weights_batch[b].tolist()
+            if wl is None:
+                wl = [1.0] * len(pl)
+            for (i, j), w in zip(pl, wl):
+                d = src_of.setdefault(int(j), {})
+                if float(w) > d.get(int(i), -1.0):
+                    d[int(i)] = float(w)
+
+        if special_ids is not None and special_ids.numel() > 0:
+            is_special = torch.isin(input_ids[b], special_ids)
+        else:
+            is_special = torch.zeros(T, dtype=torch.bool, device=device)
+
+        tgt_rows = (~is_ctx & valid_key).nonzero(as_tuple=False).flatten().tolist()
+        for q in tgt_rows:
+            if q == 0:
+                continue
+            S = src_of.get(q, {})
+            cand = (is_ctx & valid_key & ~is_special).clone()
+            cand[0] = False                                  # sink / NaN safety
+            if q < T:
+                cand[q:] = False                             # keys strictly before q
+            # Protect this target's annotation sources. Uniform: protect ALL
+            # sources. Weight-aware: protect only FIRST-ORDER (w>=1) sources;
+            # transitive sources (w<1) stay maskable with weight-dependent prob,
+            # which is what makes the gradation meaningful.
+            if S:
+                if weight_aware:
+                    prot = [i for i, w in S.items() if w >= 1.0 - 1e-9 and 0 <= i < T]
+                else:
+                    prot = [i for i in S if 0 <= i < T]
+                if prot:
+                    cand[torch.tensor(prot, dtype=torch.long, device=device)] = False
+            if protect_prefix > 0:
+                cand[: min(protect_prefix, T)] = False
+            if recency_window > 0:
+                lo = max(0, q - recency_window)
+                cand[lo:q] = False
+            cand_idx = cand.nonzero(as_tuple=False).flatten()
+            nc = int(cand_idx.numel())
+            tot_cand += nc
+            if nc == 0:
+                continue
+            if weight_aware:
+                w = torch.tensor([S.get(int(k), 0.0) for k in cand_idx.tolist()],
+                                 dtype=torch.float32, device=device).clamp_(0.0, 1.0)
+                pm = p_max * (1.0 - w).pow(p_gamma)
+                r = (torch.rand(nc, generator=generator, device=device)
+                     if generator is not None else torch.rand(nc, device=device))
+                chosen = cand_idx[r < pm]
+            else:
+                k = int(round(rate * nc))
+                if k <= 0:
+                    continue
+                perm = torch.randperm(nc, generator=generator, device=device)[:k]
+                chosen = cand_idx[perm]
+            if chosen.numel() > 0:
+                a[q, chosen] = False
+                tot_masked += int(chosen.numel())
+        allow[b, 0] = a
+
+    return PerTargetMaskStats(
+        allow=allow,
+        n_masked=tot_masked / max(1, B),
+        n_candidates=tot_cand / max(1, B),
+        frac_masked=(tot_masked / tot_cand) if tot_cand > 0 else 0.0,
+    )
+
+
+# ── RRR: Right for the Right Reasons input-gradient penalty (Ross et al. 2017) ─
+# Penalize the input-EMBEDDING gradient mass of the CE loss that lands OUTSIDE the
+# annotated "right reasons" tokens. Unlike attention-based saliency (cheap but
+# gameable; cf. Pruthi 2020), input gradients tie directly to the prediction, so
+# they are a more faithful attribution to regularize. Cost: needs DOUBLE BACKPROP
+# (the penalty contains d(CE)/d(inputs_embeds) computed with create_graph=True),
+# so ~2x a normal step; eager attention is required because fused SDPA kernels
+# have no double-backward. Training-only: nothing is added to the model/inference.
+
+def annotation_endpoint_mask(annot_pairs_batch, B: int, T: int, device) -> Tensor:
+    """``[B, T]`` bool mask: True where a token is an endpoint (source OR target)
+    of any annotation edge — i.e. the dependency-relevant ("right reasons") tokens
+    that RRR lets the model rely on. Tokens that are never an endpoint are the ones
+    whose input-gradient mass gets penalized."""
+    m = torch.zeros(B, T, dtype=torch.bool, device=device)
+    for b, pairs in enumerate(annot_pairs_batch):
+        if pairs is None or int(getattr(pairs, "numel", lambda: 0)()) == 0:
+            continue
+        idx = pairs.to(device=device, dtype=torch.long).clamp_(0, T - 1).reshape(-1)
+        m[b].index_fill_(0, idx, True)
+    return m
+
+
+def rrr_gradient_penalty(
+    input_grad: Tensor,        # [B, T, H] = d(CE)/d(inputs_embeds)
+    allowed_mask: Tensor,      # [B, T] 1 = right-reason token (exempt from penalty)
+    valid_mask: Tensor,        # [B, T] 1 = real (non-pad) token
+    *,
+    mode: str = "l2",          # "l2" -> sum_h g^2 ; "l1" -> sum_h |g|
+    normalize: bool = True,    # True -> fraction of input-grad mass on wrong tokens (in [0, 1])
+) -> Tensor:
+    """RRR input-gradient penalty (Ross et al. 2017). Pushes input-gradient mass
+    OFF tokens that are not annotation endpoints. With ``normalize`` the result is
+    the *fraction* of input-gradient mass on wrong tokens (scale-free, in [0, 1]),
+    which keeps the penalty well-conditioned across steps. Returns a scalar in
+    ``input_grad.dtype`` (0 if there is nothing to penalize)."""
+    g = input_grad.float()
+    sal = g.abs().sum(-1) if mode == "l1" else g.pow(2).sum(-1)     # [B, T]
+    valid = valid_mask.to(sal.dtype)
+    penalize = valid * (1.0 - allowed_mask.to(sal.dtype))          # [B, T]
+    num = (sal * penalize).sum()
+    if normalize:
+        denom = (sal * valid).sum().clamp_min(1e-12)
+    else:
+        denom = penalize.sum().clamp_min(1.0)
+    return (num / denom).to(input_grad.dtype)
+
+
+# ── Auxiliary edge-prediction objective (GraphCodeBERT / GALLa style) ──────────
+# A robust, additive alternative to cfmask. Instead of *masking* shortcut tokens
+# or forcing an attribution metric (saliency), add a small bilinear head that
+# PREDICTS the annotation edges from the model's own hidden states, as a BCE term
+# next to CE. It is additive + fully in-distribution (no perturbed forward), so it
+# is far more stable than cfmask, and it forces the representation to *encode* the
+# dependency (harder to game than attention; cf. Pruthi et al. ACL 2020). The head
+# is training-only and dropped at inference (cf. GALLa's GNN, arXiv:2409.04183).
+# Differences vs the papers: (1) decoder-only causal LM -> strictly-causal s<q
+# edges, not a bidirectional encoder; (2) edges are per-example token->token
+# graph-signal annotations, not parsed AST/DFG; (3) a low-rank biaffine scorer on
+# the LM's own last hidden state, no external GNN.
+
+def edge_prediction_loss(
+    hidden_states: Tensor,                  # [B, T, H] last hidden state
+    annot_pairs,                            # list[[N, 2]] or flat [E, 3]
+    src_proj,                               # nn.Linear(H, d, bias=False): key/source
+    dst_proj,                               # nn.Linear(H, d, bias=False): query/target
+    *,
+    neg_weight: float = 1.0,
+    neg_sample_k: int = 0,
+    temperature: float = 1.0,
+    exclude_source_mask: Tensor | None = None,   # [B, T] bool: True = drop from negatives
+    generator: torch.Generator | None = None,
+) -> Tensor:
+    """Decoupled per-edge BCE. For each target (query) token q, push the score of
+    its annotated source tokens s (edge s->q, s<q) up and non-annotated causal
+    sources down: score(q,s) = <dst_proj(h_q), src_proj(h_s)> / (sqrt(d)*tau).
+    No shared softmax denominator (positives don't compete), so it is stable.
+    Returns a scalar in ``hidden_states.dtype`` (0 if the batch has no edges)."""
+    B, T, _ = hidden_states.shape
+    device = hidden_states.device
+    row_batch, row_qry, src_all, inv = _annotation_rows_from_pairs(
+        annot_pairs, B=B, T=T, device=device)
+    if row_qry.numel() == 0:
+        return hidden_states.new_zeros(())
+    Q = row_qry.numel()
+    h = hidden_states.float()
+    K = src_proj(h)                                   # [B, T, d]
+    d = K.shape[-1]
+    qv = dst_proj(h[row_batch, row_qry])              # [Q, d]
+    scale = 1.0 / (float(d) ** 0.5) / max(float(temperature), 1e-6)
+    if B == 1:
+        scores = (qv @ K[0].transpose(0, 1)) * scale          # [Q, T] (avoid [Q,T,d])
+    else:
+        scores = torch.einsum("qd,qsd->qs", qv, K[row_batch]) * scale
+    # positives A_pos[q, s]
+    A_adj = torch.zeros(Q, T, device=device, dtype=scores.dtype)
+    A_adj.index_put_(
+        (inv.to(device=device, dtype=torch.long), src_all.to(device=device, dtype=torch.long)),
+        torch.ones_like(src_all, device=device, dtype=scores.dtype), accumulate=True)
+    A_pos = (A_adj > 0).to(scores.dtype)
+    src_idx = torch.arange(T, device=device).unsqueeze(0)
+    qry_col = row_qry.to(device=device, dtype=torch.long).unsqueeze(1)
+    M_causal = (src_idx < qry_col).to(scores.dtype)            # strictly before q (s < q)
+    pos_mask = M_causal * A_pos
+    neg_mask = M_causal * (1.0 - A_pos)
+    if exclude_source_mask is not None:
+        keep = (1.0 - exclude_source_mask.to(device=device, dtype=scores.dtype)[row_batch]).clamp_(0.0, 1.0)
+        neg_mask = neg_mask * keep
+    if int(neg_sample_k) > 0:                                  # optional MoCo-style subsample
+        k = int(neg_sample_k)
+        with torch.no_grad():
+            rows = (neg_mask.sum(dim=-1) > k).nonzero(as_tuple=True)[0]
+            if rows.numel() > 0:
+                w = neg_mask[rows].to(torch.float32) + 1e-12
+                w = w * neg_mask[rows].to(torch.float32)
+                idx = torch.multinomial(w, num_samples=k, replacement=False, generator=generator)
+                newm = torch.zeros_like(neg_mask[rows]); newm.scatter_(1, idx, 1.0)
+                neg_mask = neg_mask.clone(); neg_mask[rows] = newm
+    valid = pos_mask.sum(dim=-1) > 0
+    if not bool(valid.any()):
+        return hidden_states.new_zeros(())
+    # logits BCE: positives -> softplus(-s) = -log sigma(s); negatives -> softplus(+s)
+    pos_term = (F.softplus(-scores) * pos_mask).sum(-1) / pos_mask.sum(-1).clamp_min(1.0)
+    neg_term = (F.softplus(scores) * neg_mask).sum(-1) / neg_mask.sum(-1).clamp_min(1.0)
+    loss = (pos_term + float(neg_weight) * neg_term)[valid].mean()
+    return loss.to(hidden_states.dtype)
+
+
+# ── Soft additive graph attention bias (T5 / ALiBi style, keyed on annotations) ─
+# Instead of MASKING shortcut keys to -inf (cfmask), ADD a small *learned* positive
+# bias g*w to the attention logits of annotated edges (key s -> query q, s<q),
+# passed as a 4-D additive attention mask. The gate g then receives gradient from
+# CE through the softmax and is learned end-to-end (it can go ->0 where unhelpful,
+# degrading gracefully instead of hurting a strong baseline). At inference with no
+# annotation graph the bias is simply not applied (the LM runs unchanged), so the
+# benefit is internalized into the weights (cf. GALLa "structure only at
+# training"). Differences vs ALiBi/T5: the bias is keyed on a per-example
+# dependency graph rather than relative position, and is a single shared learnable
+# scalar gate (optionally scaled by the augmented-edge weight), not a fixed
+# per-head slope.
+
+def build_graph_attention_bias(
+    input_ids: Tensor,                       # [B, T]
+    attention_mask: Tensor,                  # [B, T] (1 = real, 0 = pad)
+    annot_pairs_batch,                       # per-sample [N, 2] (qi, qj) with qi < qj
+    gate,                                    # scalar Tensor / nn.Parameter (trainable)
+    *,
+    annot_weights_batch=None,                # per-sample [N] edge weights, or None
+    comp_dtype=torch.bfloat16,
+) -> Tensor:
+    """Return a ``[B, 1, T, T]`` additive attention bias: ``-inf`` on disallowed
+    (future / padding) keys, ``0`` on allowed non-annotated keys, and
+    ``+gate*weight`` on allowed annotated edges (key s -> query q). Differentiable
+    w.r.t. ``gate`` (built with ``torch.where`` + ``stack``, no in-place into a
+    detached buffer)."""
+    device = input_ids.device
+    B, T = input_ids.shape
+    causal = torch.tril(torch.ones(T, T, dtype=torch.bool, device=device))
+    neg_t = torch.tensor(torch.finfo(comp_dtype).min, dtype=comp_dtype, device=device)
+    rows = []
+    for b in range(B):
+        valid_key = attention_mask[b].bool()
+        allow = causal & valid_key.unsqueeze(0)                # [T(q), T(k)]
+        W = torch.zeros(T, T, dtype=torch.float32, device=device)   # W[q, s]
+        pairs = annot_pairs_batch[b] if b < len(annot_pairs_batch) else None
+        if pairs is not None and pairs.numel() > 0:
+            qi = pairs[:, 0].to(device=device, dtype=torch.long).clamp_(0, T - 1)   # src (earlier)
+            qj = pairs[:, 1].to(device=device, dtype=torch.long).clamp_(0, T - 1)   # dst (later)
+            if (annot_weights_batch is not None and b < len(annot_weights_batch)
+                    and annot_weights_batch[b] is not None
+                    and annot_weights_batch[b].numel() == pairs.shape[0]):
+                wv = annot_weights_batch[b].to(device=device, dtype=torch.float32)
+            else:
+                wv = torch.ones(pairs.shape[0], dtype=torch.float32, device=device)
+            W[qj, qi] = wv                                      # query qj attends key qi
+        bonus = (gate * W).to(comp_dtype)                      # differentiable through gate
+        rows.append(torch.where(allow, bonus, neg_t))
+    return torch.stack(rows, dim=0).unsqueeze(1)               # [B, 1, T, T]
+
+
+def shortcut_invariance_kl(
+    logits_clean: Tensor,   # [B, T, V]
+    logits_masked: Tensor,  # [B, T, V]
+    labels: Tensor,         # [B, T]
+    *,
+    ignore_index: int = IGNORE_INDEX,
+    only_clean_correct: bool = True,
+) -> Tensor:
+    """KL( p_clean(stop-grad) || p_masked ) averaged over target prediction rows.
+
+    Uses the standard next-token shift: the distribution that predicts gold token
+    at position j lives at logits[:, j-1]. By default the term is applied only
+    where the *clean* model already predicts the gold token, so the objective is
+    "removing shortcuts must not change answers you already get right" — robust to
+    incomplete annotations (it never asserts a possibly-wrong target under heavy
+    masking). Gradient flows through ``logits_masked`` only.
+    """
+    lc = logits_clean[:, :-1, :].float()
+    lm = logits_masked[:, :-1, :].float()
+    gold = labels[:, 1:]
+    valid = gold.ne(ignore_index)
+    if only_clean_correct:
+        valid = valid & (lc.argmax(dim=-1) == gold)
+    if valid.sum() == 0:
+        return logits_clean.new_zeros(())
+    lc_v = lc[valid]
+    lm_v = lm[valid]
+    logp_clean = F.log_softmax(lc_v, dim=-1)
+    p_clean = logp_clean.exp().detach()
+    logp_clean = logp_clean.detach()
+    logp_masked = F.log_softmax(lm_v, dim=-1)
+    kl = (p_clean * (logp_clean - logp_masked)).sum(dim=-1)
+    return kl.mean()

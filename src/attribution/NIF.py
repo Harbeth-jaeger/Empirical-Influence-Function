@@ -1524,7 +1524,7 @@ def main_compute_gradient_related_samples():
     # compress json size
     dumped_json = round_floats(dumped_json, 5)
 
-    # this file is displayed in src/viz/correlation-report
+    # this file is displayed in tools/correlation-report
     # filename encodes the experiment parameters so multiple runs don't overwrite each other
     saliency_filename = f'./saliency_test{SELECTED_TEST_SAMPLE_INDEX}_tok{TOKEN_INDEX_TO_RETRIEVE}.json'
     with open(saliency_filename, 'w', encoding = 'utf-8') as f:

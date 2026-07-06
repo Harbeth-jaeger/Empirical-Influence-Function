@@ -7,8 +7,6 @@ import random
 import threading
 import time
 from pathlib import Path
-from typing import Any
-from types import SimpleNamespace
 
 _key_file = Path("./data/openai_key.txt")
 if not os.environ.get("OPENAI_API_KEY") and _key_file.exists():
@@ -18,99 +16,7 @@ from dataclasses import dataclass
 
 _OPENAI_RATE_LOCK = threading.Lock()
 _OPENAI_LAST_REQUEST_TS = 0.0
-
-# Cache tree-sitter Language objects per language name (immutable, thread-safe).
-# Parsers are still created per call because tree-sitter Parser is not
-# thread-safe and get_edges runs under many worker threads.
-_TS_LANG_CACHE: dict[str, Any] = {}
-_TS_LANG_LOCK = threading.Lock()
 _OPENAI_CLIENT_LOCAL = threading.local()
-
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _optional_env_flag(*names: str) -> bool | None:
-    for name in names:
-        if name in os.environ:
-            return _env_flag(name)
-    return None
-
-
-def _json_object_env(name: str) -> dict[str, Any]:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return {}
-    parsed = json.loads(raw)
-    if not isinstance(parsed, dict):
-        raise ValueError(f"{name} must be a JSON object")
-    return parsed
-
-
-def _annotation_extra_headers() -> dict[str, str]:
-    headers = {str(k): str(v) for k, v in _json_object_env("ANNOTATE_EXTRA_HEADERS_JSON").items()}
-    hw_id = os.environ.get("HW_ID") or os.environ.get("HUAWEI_HW_ID")
-    hw_appkey = os.environ.get("HW_APPKEY") or os.environ.get("HUAWEI_HW_APPKEY")
-    if hw_id:
-        headers.setdefault("X-HW-ID", hw_id)
-    if hw_appkey:
-        headers.setdefault("X-HW-APPKEY", hw_appkey)
-    return headers
-
-
-def _annotation_extra_body() -> dict[str, Any]:
-    body = _json_object_env("ANNOTATE_EXTRA_BODY_JSON")
-    hw_id = os.environ.get("HW_ID") or os.environ.get("HUAWEI_HW_ID")
-    app_id = os.environ.get("HW_APP_ID") or os.environ.get("HUAWEI_APP_ID") or hw_id
-    scene = os.environ.get("HW_SCENE") or os.environ.get("HUAWEI_SCENE")
-    operator = os.environ.get("HW_OPERATOR") or os.environ.get("HUAWEI_OPERATOR")
-    if app_id:
-        body.setdefault("appId", app_id)
-    if scene:
-        body.setdefault("scene", scene)
-    if operator:
-        body.setdefault("operator", operator)
-
-    enable_thinking = _optional_env_flag("HW_ENABLE_THINKING", "HUAWEI_ENABLE_THINKING")
-    if enable_thinking is not None:
-        chat_template_kwargs = dict(body.get("chat_template_kwargs") or {})
-        chat_template_kwargs.setdefault("enable_thinking", enable_thinking)
-        body["chat_template_kwargs"] = chat_template_kwargs
-    return body
-
-
-def _build_openai_client() -> OpenAI:
-    kwargs: dict[str, Any] = {}
-    if os.environ.get("OPENAI_API_KEY"):
-        kwargs["api_key"] = os.environ["OPENAI_API_KEY"]
-    if os.environ.get("OPENAI_BASE_URL"):
-        kwargs["base_url"] = os.environ["OPENAI_BASE_URL"]
-
-    # Bypass any HTTP(S)_PROXY for local endpoints by default — otherwise a proxy
-    # set for VPN access hijacks requests to localhost and fails with
-    # APIConnectionError. Explicit ANNOTATE_HTTP_PROXY_NONE / HUAWEI_DISABLE_PROXY
-    # still override this.
-    explicit_no_proxy = _optional_env_flag("ANNOTATE_HTTP_PROXY_NONE", "HUAWEI_DISABLE_PROXY")
-    base_url = str(kwargs.get("base_url", "") or "")
-    is_local_endpoint = any(h in base_url for h in ("localhost", "127.0.0.1", "0.0.0.0", "::1"))
-    disable_proxy = explicit_no_proxy if explicit_no_proxy is not None else is_local_endpoint
-    verify_ssl = _env_flag("ANNOTATE_VERIFY_SSL", default=True)
-    if _env_flag("HUAWEI_INSECURE"):
-        verify_ssl = False
-    if disable_proxy or not verify_ssl:
-        try:
-            import httpx
-        except ImportError as exc:
-            raise RuntimeError("Install httpx to use custom Huawei/OpenAI HTTP transport") from exc
-        transport_kwargs: dict[str, Any] = {"verify": verify_ssl}
-        if disable_proxy:
-            transport_kwargs["proxy"] = None
-        kwargs["http_client"] = httpx.Client(transport=httpx.HTTPTransport(**transport_kwargs))
-    return OpenAI(**kwargs)
 
 
 def get_thread_local_openai_client() -> OpenAI:
@@ -122,7 +28,7 @@ def get_thread_local_openai_client() -> OpenAI:
     """
     client = getattr(_OPENAI_CLIENT_LOCAL, "client", None)
     if client is None:
-        client = _build_openai_client()
+        client = OpenAI()
         _OPENAI_CLIENT_LOCAL.client = client
     return client
 
@@ -132,160 +38,14 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return "429" in text or "too many requests" in text or "rate limit" in text
 
 
-def _is_retryable_error(exc: Exception) -> bool:
-    """Rate limits plus transient network / server errors worth retrying
-    (connection drops, timeouts, 5xx from an overloaded or restarting endpoint)."""
-    if _is_rate_limit_error(exc):
-        return True
-    name = type(exc).__name__.lower()
-    if any(s in name for s in ("connection", "timeout", "internalservererror", "apierror")):
-        return True
-    text = str(exc).lower()
-    return any(s in text for s in (
-        "connection error", "connection reset", "connection aborted", "timed out",
-        "timeout", "bad gateway", "service unavailable", "gateway timeout",
-        "error code: 500", "error code: 502", "error code: 503", "error code: 504",
-    ))
-
-
-def _chat_response_message(response: Any) -> Any | None:
-    if isinstance(response, str):
-        return None
-    choices = getattr(response, "choices", None)
-    if not choices and isinstance(response, dict):
-        choices = response.get("choices")
-    if not choices:
-        return None
-    first = choices[0]
-    if isinstance(first, dict):
-        return first.get("message") or first.get("delta") or first
-    return getattr(first, "message", None) or first
-
-
-def _chat_response_text(response: Any) -> str:
-    if isinstance(response, str):
-        return response
-    msg = _chat_response_message(response)
-    if msg is None:
-        return ""
-    if isinstance(msg, str):
-        return msg
-    if isinstance(msg, dict):
-        content = msg.get("content", "")
-    else:
-        content = getattr(msg, "content", "")
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, dict):
-                parts.append(str(item.get("text") or item.get("content") or ""))
-            else:
-                parts.append(str(item))
-        return "".join(parts)
-    return str(content or "")
-
-
-def _chat_response_finish_reason(response: Any) -> str:
-    if isinstance(response, str):
-        return "stop"
-    choices = getattr(response, "choices", None)
-    if not choices and isinstance(response, dict):
-        choices = response.get("choices")
-    if not choices:
-        return ""
-    first = choices[0]
-    if isinstance(first, dict):
-        return str(first.get("finish_reason") or "")
-    return str(getattr(first, "finish_reason", "") or "")
-
-
-def _chat_stream_text(response: Any) -> str:
-    parts: list[str] = []
-    for chunk in response:
-        choices = getattr(chunk, "choices", None)
-        if not choices and isinstance(chunk, dict):
-            choices = chunk.get("choices")
-        if not choices:
-            continue
-        first = choices[0]
-        delta = first.get("delta") if isinstance(first, dict) else getattr(first, "delta", None)
-        if delta is None:
-            continue
-        if isinstance(delta, dict):
-            content = delta.get("content", "")
-        else:
-            content = getattr(delta, "content", "")
-        if content:
-            parts.append(str(content))
-    return "".join(parts)
-
-
-def _huawei_text_content_messages(messages: Any) -> Any:
-    if not isinstance(messages, list):
-        return messages
-    converted: list[Any] = []
-    for msg in messages:
-        if not isinstance(msg, dict):
-            converted.append(msg)
-            continue
-        content = msg.get("content")
-        if isinstance(content, str):
-            new_msg = dict(msg)
-            new_msg["content"] = [{"type": "text", "text": content}]
-            converted.append(new_msg)
-        else:
-            converted.append(msg)
-    return converted
-
-
 def _rate_limited_chat_completion(client: OpenAI, **kwargs):
     global _OPENAI_LAST_REQUEST_TS
-    # Default 0 = no artificial spacing (throughput bounded only by num_workers
-    # and endpoint latency). The reactive 429 backoff below still protects
-    # rate-limited gateways; set ANNOTATE_MIN_REQUEST_INTERVAL to re-enable.
-    min_interval = float(os.environ.get("ANNOTATE_MIN_REQUEST_INTERVAL", "0"))
+    min_interval = float(os.environ.get("ANNOTATE_MIN_REQUEST_INTERVAL", "1.2"))
     max_retries = int(os.environ.get("ANNOTATE_MAX_RETRIES", "8"))
     base_sleep = float(os.environ.get("ANNOTATE_RETRY_BASE_SLEEP", "10"))
     request_timeout = os.environ.get("ANNOTATE_REQUEST_TIMEOUT")
     if request_timeout and "timeout" not in kwargs:
         kwargs["timeout"] = float(request_timeout)
-    request_temperature = os.environ.get("ANNOTATE_TEMPERATURE")
-    if request_temperature is not None and "temperature" in kwargs:
-        kwargs["temperature"] = float(request_temperature)
-
-    extra_headers = _annotation_extra_headers()
-    if extra_headers:
-        merged_headers = dict(extra_headers)
-        merged_headers.update(kwargs.get("extra_headers") or {})
-        kwargs["extra_headers"] = merged_headers
-
-    extra_body = _annotation_extra_body()
-    if extra_body:
-        merged_body = dict(extra_body)
-        merged_body.update(kwargs.get("extra_body") or {})
-        kwargs["extra_body"] = merged_body
-
-    huawei_template_mode = _env_flag("ANNOTATE_HUAWEI_TEMPLATE_MODE") or _env_flag("REQUIRE_HUAWEI_GATEWAY", True)
-    if huawei_template_mode:
-        # Huawei's reference template puts sampling params in extra_body, uses
-        # streaming, and represents text messages as multimodal content items.
-        # Some deployments return 500 for OpenAI-standard top-level fields such
-        # as response_format/max_tokens/temperature.
-        body = dict(kwargs.get("extra_body") or {})
-        if "temperature" in kwargs:
-            body.setdefault("temperature", kwargs.pop("temperature"))
-        elif request_temperature is not None:
-            body.setdefault("temperature", float(request_temperature))
-        kwargs["extra_body"] = body
-        if not _env_flag("ANNOTATE_KEEP_RESPONSE_FORMAT"):
-            kwargs.pop("response_format", None)
-        if not _env_flag("ANNOTATE_KEEP_MAX_TOKENS"):
-            kwargs.pop("max_tokens", None)
-        if _env_flag("ANNOTATE_HUAWEI_CONTENT_LIST", True):
-            kwargs["messages"] = _huawei_text_content_messages(kwargs.get("messages"))
-
-    if _env_flag("ANNOTATE_STREAM") and "stream" not in kwargs and not kwargs.get("tools"):
-        kwargs["stream"] = True
 
     for attempt in range(max_retries + 1):
         with _OPENAI_RATE_LOCK:
@@ -295,28 +55,13 @@ def _rate_limited_chat_completion(client: OpenAI, **kwargs):
                 time.sleep(wait)
             _OPENAI_LAST_REQUEST_TS = time.monotonic()
         try:
-            response = client.chat.completions.create(**kwargs)
-            if kwargs.get("stream"):
-                content = _chat_stream_text(response)
-                return SimpleNamespace(
-                    choices=[
-                        SimpleNamespace(
-                            message=SimpleNamespace(content=content),
-                            finish_reason="stop",
-                        )
-                    ]
-                )
-            return response
+            return client.chat.completions.create(**kwargs)
         except Exception as exc:
-            if attempt >= max_retries or not _is_retryable_error(exc):
+            if attempt >= max_retries or not _is_rate_limit_error(exc):
                 raise
-            if _is_rate_limit_error(exc):
-                # ModelArts sometimes reports both 1 QPS and 3 RPM. Back off generously.
-                sleep_s = max(base_sleep * (attempt + 1), min_interval) + random.uniform(0, 1.5)
-            else:
-                # Transient network / 5xx error: exponential backoff, capped.
-                sleep_s = min(2 ** attempt, 30) + random.uniform(0, 1.0)
-            print(f"[warn] retryable error, retry {attempt + 1}/{max_retries} after {sleep_s:.1f}s: {exc}")
+            # ModelArts sometimes reports both 1 QPS and 3 RPM. Back off generously.
+            sleep_s = max(base_sleep * (attempt + 1), min_interval) + random.uniform(0, 1.5)
+            print(f"[warn] rate limited, retry {attempt + 1}/{max_retries} after {sleep_s:.1f}s: {exc}")
             time.sleep(sleep_s)
 
 
@@ -366,7 +111,6 @@ _CALL_NODE_TYPES = {
 _SELECTOR_NODE_TYPES = {
     "selector_expression",       # Go: pkg.Func / obj.Method / val.Field
     "member_access_expression",  # C#: obj.Method
-    "member_expression",         # JavaScript/TypeScript: obj.method / obj.prop / this._x
     "field_expression",          # Rust/C variants
     "qualified_name",            # Java/C# namespace or type member
     "scoped_identifier",         # C++/Rust A::B
@@ -410,7 +154,7 @@ _NAME_TOKEN_NODE_TYPES = {
     "type_identifier",
 }
 
-_SKIP_LEAF_TEXT = {"", ",", ";", ".", "(", ")", "{", "}", "[", "]"}
+_SKIP_LEAF_TEXT = {"", ",", ";", "(", ")", "{", "}", "[", "]"}
 
 
 @dataclass
@@ -462,15 +206,9 @@ class SyntacticCheckerTool:
             return []
         try:
             from tree_sitter import Language, Parser
-            lang = _TS_LANG_CACHE.get(language)
-            if lang is None:
-                with _TS_LANG_LOCK:
-                    lang = _TS_LANG_CACHE.get(language)
-                    if lang is None:
-                        pkg = importlib.import_module(pkg_name)
-                        lang = Language(pkg.language())
-                        _TS_LANG_CACHE[language] = lang
-            parser = Parser(lang)  # per-call: Parser is not thread-safe
+            pkg = importlib.import_module(pkg_name)
+            lang = Language(pkg.language())
+            parser = Parser(lang)
 
             # C# / Java: a bare method outside a class is not a valid top-level
             # construct in tree-sitter's grammar — it parses as global_statement /
@@ -501,19 +239,7 @@ class SyntacticCheckerTool:
         offset_to_idx = self._build_offset_map(subwords)
         edges: list[StructuralEdge] = []
         self._walk(root, parse_code, offset_to_idx, subwords, edges, parse_char_offset)
-        return self._dedupe_edges(edges)
-
-    @staticmethod
-    def _dedupe_edges(edges: list[StructuralEdge]) -> list[StructuralEdge]:
-        out: list[StructuralEdge] = []
-        seen: set[tuple[int, int, str]] = set()
-        for edge in edges:
-            key = (int(edge.token_i_idx), int(edge.token_j_idx), str(edge.reason))
-            if key in seen or key[0] == key[1]:
-                continue
-            seen.add(key)
-            out.append(edge)
-        return out
+        return edges
 
     # ── Build offset → token index map ───────────────────────────────────────
 
@@ -554,7 +280,6 @@ class SyntacticCheckerTool:
         # Global passes (single traversal over the whole tree)
         self._bracket_edges(root, code, offset_to_idx, subwords, edges, char_offset)
         self._defuse_edges(root, code, offset_to_idx, subwords, edges, char_offset)
-        self._go_qualified_type_edges(root, code, offset_to_idx, subwords, edges, char_offset)
         # Per-node passes (visit each node once)
         self._walk_structural(root, code, offset_to_idx, subwords, edges, char_offset)
 
@@ -689,86 +414,6 @@ class SyntacticCheckerTool:
         for src in self._leaf_token_indices(base_node, code, offset_to_idx, subwords, char_offset):
             if src != dst:
                 edges.append(StructuralEdge(src, dst, "api"))
-
-    def _qualified_type_name_node(self, node):
-        name = node.child_by_field_name("name")
-        if name is not None:
-            return name
-        for child in reversed(node.children):
-            if child.type in {"type_identifier", "identifier", "package_identifier"}:
-                return child
-        return None
-
-    def _qualified_type_internal_edges(self, node, code, offset_to_idx, subwords, edges, char_offset=0):
-        """Go type selector: package token predicts selected type name in pkg.Type."""
-        if node.type != "qualified_type":
-            return
-        name_node = self._qualified_type_name_node(node)
-        if name_node is None:
-            return
-        dst = self._resolve(name_node.start_byte, name_node.end_byte, code, offset_to_idx, subwords, char_offset)
-        if dst == -1:
-            return
-        package = node.child_by_field_name("package")
-        package_nodes = [package] if package is not None else []
-        if not package_nodes:
-            package_nodes = [
-                c for c in node.children
-                if c.type in {"package_identifier", "identifier"} and c is not name_node
-            ]
-        for package_node in package_nodes:
-            src = self._resolve(package_node.start_byte, package_node.end_byte, code, offset_to_idx, subwords, char_offset)
-            if src != -1 and src != dst:
-                edges.append(StructuralEdge(src, dst, "api"))
-
-    def _go_qualified_type_edges(self, root, code, offset_to_idx, subwords, edges, char_offset=0):
-        """Cover Go qualified types in type positions, e.g. chan *pkg.Type or []pkg.Type.
-
-        tree-sitter-go parses these as `qualified_type`, not `selector_expression`,
-        so the normal selector pass does not see them.  Emit both the direct
-        package -> type selector edge and type -> declared-name edges.
-        """
-
-        def declared_name_nodes(node):
-            if node.type == "parameter_declaration":
-                out = []
-                for child in node.children:
-                    if child.type in {"identifier", "field_identifier", "simple_identifier", "variable_name"}:
-                        out.append(child)
-                    else:
-                        break
-                return out
-            if node.type in {"var_spec", "const_spec", "field_declaration"}:
-                name = node.child_by_field_name("name")
-                if name is not None:
-                    return [name]
-                return [
-                    c for c in node.children
-                    if c.type in {"identifier", "field_identifier", "simple_identifier", "variable_name"}
-                ][:1]
-            return []
-
-        def walk(node):
-            if node.type == "qualified_type":
-                self._qualified_type_internal_edges(node, code, offset_to_idx, subwords, edges, char_offset)
-
-            type_node = node.child_by_field_name("type")
-            if type_node is not None:
-                names = declared_name_nodes(node)
-                if names:
-                    type_indices = self._type_leaf_indices(type_node, code, offset_to_idx, subwords, char_offset)
-                    for name in names:
-                        dst = self._resolve(name.start_byte, name.end_byte, code, offset_to_idx, subwords, char_offset)
-                        if dst == -1:
-                            continue
-                        for src in type_indices:
-                            if src != dst:
-                                edges.append(StructuralEdge(src, dst, "type"))
-
-            for child in node.children:
-                walk(child)
-
-        walk(root)
 
     def _callee_token_indices(self, callee_node, code, offset_to_idx, subwords, char_offset=0) -> list[int]:
         if callee_node is None:
@@ -1078,51 +723,7 @@ class SyntacticCheckerTool:
             name_node = next((c for c in node.children if c.type in IDENT_TYPES), None)
             return [name_node] if name_node is not None else []
 
-        def collect_python_parameter_nodes(fn_node):
-            params = fn_node.child_by_field_name("parameters")
-            if params is None:
-                params = next((c for c in fn_node.children if c.type == "parameters"), None)
-            if params is None:
-                return []
-            out = []
-
-            def add_name(n):
-                if n is not None and n.type in IDENT_TYPES and code[n.start_byte:n.end_byte] != "_":
-                    out.append(n)
-
-            def walk_param(n):
-                # Python tree-sitter uses wrappers such as typed_parameter, default_parameter,
-                # list_splat_pattern and dictionary_splat_pattern. Prefer their `name` field
-                # so identifiers in default values are not misclassified as declarations.
-                name = n.child_by_field_name("name")
-                if name is not None:
-                    add_name(name)
-                    return
-                if n.type in IDENT_TYPES:
-                    add_name(n)
-                    return
-                if n.type in {"typed_parameter", "default_parameter", "list_splat_pattern", "dictionary_splat_pattern"}:
-                    for c in n.children:
-                        if c.type in IDENT_TYPES:
-                            add_name(c)
-                            return
-                for c in n.children:
-                    if c.type in {",", "(", ")", "*", "**", "/"}:
-                        continue
-                    walk_param(c)
-
-            for child in params.children:
-                walk_param(child)
-            return out
-
         def collect_decls(node):
-            if node.type in {"function_definition", "function_declaration"}:
-                for name_node in collect_python_parameter_nodes(node):
-                    surface = code[name_node.start_byte:name_node.end_byte]
-                    idx = self._resolve(name_node.start_byte, name_node.end_byte,
-                                        code, offset_to_idx, subwords, char_offset)
-                    if idx != -1:
-                        decl_map.setdefault(surface, []).append(idx)
             if node.type in DECL_PARENTS:
                 for name_node in collect_decl_name_nodes(node):
                     surface = code[name_node.start_byte:name_node.end_byte]
@@ -1323,131 +924,6 @@ class AnnotatorAgent:
         },
     ]
 
-    def _extract_pairs_from_text(self, text: str) -> list[dict]:
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start < 0 or end <= start:
-                return []
-            try:
-                parsed = json.loads(text[start:end + 1])
-            except json.JSONDecodeError:
-                return []
-        if isinstance(parsed, list):
-            return parsed
-        if isinstance(parsed, dict):
-            for key in ("pairs", "edges", "annotations", "correlations"):
-                value = parsed.get(key)
-                if isinstance(value, list):
-                    return value
-        return []
-
-    def _annotate_without_tools(
-        self,
-        code: str,
-        subwords: list[SubwordToken],
-        target_indices: set[int] | None = None,
-        ts_code: str | None = None,
-        ts_char_offset: int = 0,
-    ) -> list[TokenCorrelation]:
-        """Fallback for hosted APIs that reject OpenAI tool calling.
-
-        It preserves the original src.annotate design as much as possible:
-        deterministic tree-sitter edges are still seeded locally, and the LLM is
-        asked once to add dataflow/semantic/api edges as plain JSON.
-        """
-        indexed = {i: sw.surface for i, sw in enumerate(subwords)}
-        parse_text = ts_code if ts_code is not None else code
-        structural_edges = self._syntactic_tool.get_edges(
-            parse_text,
-            subwords,
-            self.language,
-            char_offset=ts_char_offset,
-        )
-        final_pairs = [
-            {"i": e.token_i_idx, "j": e.token_j_idx, "reason": e.reason}
-            for e in structural_edges
-        ]
-        structural_keys = {(p["i"], p["j"], p["reason"]) for p in final_pairs}
-
-        if target_indices is None:
-            candidate_indices = list(indexed)
-        else:
-            candidate_indices = [i for i in sorted(target_indices) if i in indexed]
-        token_payload = [[i, indexed[i]] for i in candidate_indices]
-
-        system = (
-            f"You are a {self.language} code analysis expert specializing in token-level dependency analysis. "
-            "Return JSON only, no markdown. Schema: "
-            "{\"pairs\":[{\"i\":0,\"j\":1,\"reason\":\"dataflow\"}]}. "
-            "Allowed reasons: bracket, defuse, call, return, type, dataflow, semantic, api. "
-            "An edge i->j means token i helps predict token j. Use exact integer token indices. "
-            "Do not repeat seeded_structural_edges. Prefer direct, high-confidence edges."
-        )
-        user = json.dumps(
-            {
-                "code": parse_text,
-                "indexed_tokens": token_payload,
-                "seeded_structural_edges": final_pairs,
-                "task": (
-                    "Add missing dataflow, semantic, and api token dependency edges. "
-                    "Be especially careful with variable/value flow, call arguments/results, return values, "
-                    "types to variables, and API/library usage. Return at most 128 new pairs."
-                ),
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        try:
-            response = _rate_limited_chat_completion(
-                self.client,
-                model=self.model,
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                temperature=0,
-                max_tokens=int(os.environ.get("ANNOTATE_MAX_TOKENS", "1024")),
-                response_format={"type": "json_object"},
-            )
-        except Exception:
-            response = _rate_limited_chat_completion(
-                self.client,
-                model=self.model,
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                temperature=0,
-                max_tokens=int(os.environ.get("ANNOTATE_MAX_TOKENS", "1024")),
-            )
-
-        content = _chat_response_text(response)
-        for pair in self._extract_pairs_from_text(content):
-            try:
-                i = int(pair.get("i", pair.get("src", pair.get("source"))))
-                j = int(pair.get("j", pair.get("dst", pair.get("target"))))
-                reason = str(pair.get("reason", pair.get("subtype", "semantic"))).lower()
-            except Exception:
-                continue
-            if reason not in {"bracket", "defuse", "call", "return", "type", "dataflow", "semantic", "api"}:
-                reason = "semantic"
-            key = (i, j, reason)
-            if key not in structural_keys:
-                final_pairs.append({"i": i, "j": j, "reason": reason})
-                structural_keys.add(key)
-
-        _VALID_SUBTYPES = {"bracket", "defuse", "call", "return", "type", "dataflow", "semantic", "api"}
-        return [
-            TokenCorrelation(
-                token_i=indexed.get(p["i"], ""),
-                token_j=indexed.get(p["j"], ""),
-                source="NeuralNoTools",
-                subtype=p.get("reason", "semantic") if p.get("reason") in _VALID_SUBTYPES else "semantic",
-                token_i_idx=p["i"],
-                token_j_idx=p["j"],
-            )
-            for p in final_pairs
-            if p["i"] in indexed and p["j"] in indexed and p["i"] != p["j"]
-            and (target_indices is None or (p["i"] in target_indices and p["j"] in target_indices))
-        ]
-
     def _execute_tool(self, name: str, inputs: dict, code: str,
                       subwords: list[SubwordToken],
                       ts_code: str | None = None,
@@ -1612,43 +1088,16 @@ class AnnotatorAgent:
         final_pairs = []
 
         for _ in range(self.max_rounds):
-            try:
-                response = _rate_limited_chat_completion(
-                    self.client,
-                    model=self.model,
-                    tools=self.TOOLS,
-                    messages=messages,
-                )
-            except Exception as exc:
-                text = str(exc).lower()
-                should_fallback = (
-                    "tool choice" in text
-                    or "tool_call" in text
-                    or "tools" in text
-                    or _env_flag("ANNOTATE_FALLBACK_ON_CHAT_ERROR")
-                    or _env_flag("ANNOTATE_STREAM")
-                )
-                if should_fallback:
-                    return self._annotate_without_tools(
-                        code,
-                        subwords,
-                        target_indices=target_indices,
-                        ts_code=ts_code,
-                        ts_char_offset=ts_char_offset,
-                    )
-                raise
-            msg = _chat_response_message(response)
-            if msg is None:
-                return self._annotate_without_tools(
-                    code,
-                    subwords,
-                    target_indices=target_indices,
-                    ts_code=ts_code,
-                    ts_char_offset=ts_char_offset,
-                )
+            response = _rate_limited_chat_completion(
+                self.client,
+                model=self.model,
+                tools=self.TOOLS,
+                messages=messages,
+            )
+            msg = response.choices[0].message
             messages.append(msg)
 
-            finish_reason = _chat_response_finish_reason(response)
+            finish_reason = response.choices[0].finish_reason
 
             if finish_reason == "stop":
                 messages.append({"role": "user",
@@ -1656,23 +1105,14 @@ class AnnotatorAgent:
                                             "Do not end without calling it."})
                 continue
 
-            tool_calls = msg.get("tool_calls") if isinstance(msg, dict) else getattr(msg, "tool_calls", None)
-            if not tool_calls:
+            if not msg.tool_calls:
                 continue
 
             tool_results = []
             done = False
-            for tc in tool_calls:
-                if isinstance(tc, dict):
-                    fn = tc.get("function") or {}
-                    name = fn.get("name") or tc.get("name")
-                    arguments = fn.get("arguments") or tc.get("arguments") or "{}"
-                    tool_call_id = tc.get("id", name or "tool_call")
-                else:
-                    name = tc.function.name
-                    arguments = tc.function.arguments
-                    tool_call_id = tc.id
-                inputs = json.loads(arguments)
+            for tc in msg.tool_calls:
+                name = tc.function.name
+                inputs = json.loads(tc.function.arguments)
 
                 result = self._execute_tool(name, inputs, code, subwords,
                                             ts_code=ts_code, ts_char_offset=ts_char_offset)
@@ -1716,7 +1156,7 @@ class AnnotatorAgent:
 
                 tool_results.append({
                     "role": "tool",
-                    "tool_call_id": tool_call_id,
+                    "tool_call_id": tc.id,
                     "content": result,
                 })
 
