@@ -70,3 +70,4 @@ runs
 models
 *.pdf
 .vscode
+.claude
