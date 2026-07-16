@@ -69,3 +69,4 @@ data
 runs
 models
 *.pdf
+.vscode

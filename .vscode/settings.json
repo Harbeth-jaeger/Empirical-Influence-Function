@@ -1,4 +1,0 @@
-{
-    "python.terminal.activateEnvironment": false,
-    "python.defaultInterpreterPath": "${workspaceFolder}/.micromamba/envs/eif-bench/bin/python"
-}
